@@ -1,0 +1,38 @@
+# Nix build outputs
+result
+result-*
+.direnv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets. musicbox reads its bearer token and the Music Assistant JWT from
+# files on the box (see nix/module.nix), never from the repo and never from the
+# nix store. These patterns exist so a token written into the checkout during
+# local testing cannot be committed by accident.
+*.token
+token
+ma-token
+.env
+.env.*
+
+# Local sound effects used while developing. The real ones live in
+# /var/lib/musicbox/sfx on the Pi; there is no reason for mp3s to be in git.
+sfx/
+*.mp3
+*.wav
+
+# Editor / OS droppings
+.DS_Store
+*.swp
+.idea/
+.vscode/

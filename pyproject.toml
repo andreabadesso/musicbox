@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "musicbox"
+version = "0.1.0"
+description = "Event shaped HTTP API in front of Music Assistant"
+requires-python = ">=3.11"
+# Versions are deliberately unpinned. The only build that matters is the Nix
+# one, where the versions are whatever the pinned nixpkgs has, and a range here
+# would just give the runtime deps check something to fail on.
+#
+# music-assistant-client is NOT a dependency: the MA websocket client is hand
+# rolled in musicbox/ma_client.py, because reconnect behaviour and message
+# correlation are the two things this process most needs to own outright. That
+# leaves aiohttp as the only transport dependency.
+dependencies = [
+  "fastapi",
+  "uvicorn",
+  "aiohttp",
+  # The MCP server at /mcp and the musicbox-mcp stdio script. This is the
+  # official SDK and it already ships FastMCP, so the separate `fastmcp`
+  # package is NOT a dependency: adding it would put two implementations of
+  # the same decorator in the closure.
+  "mcp",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "httpx"]
+
+[project.scripts]
+musicbox-server = "musicbox.__main__:main"
+# Stdio MCP server for clients that will not speak HTTP. It controls a musicbox
+# over HTTP at MUSICBOX_URL; it does not start one.
+musicbox-mcp = "musicbox.mcp_server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["musicbox*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
