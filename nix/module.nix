@@ -325,14 +325,29 @@ in
 
     player = mkOption {
       type = types.str;
-      example = "musicbox";
+      example = "ma_musicbox";
       description = ''
         The Music Assistant player musicbox controls. Either a player id or the
         player's display name; musicbox resolves a name to an id at connect
-        time. With the audio chain below this is the snapclient's hostID, which
-        is pinned to "musicbox" precisely so this value stays stable (snapclient
-        otherwise names itself after the MAC address of whatever interface it
-        picks).
+        time.
+
+        With the audio chain below, the value you want is `ma_musicbox`. Note
+        the prefix: Music Assistant does NOT use snapclient's hostID verbatim.
+        It registers the client as
+
+          Player (type player) registered: ma_musicbox/pi5
+
+        so the id is `ma_` plus the hostID, and the display name is the
+        client's HOSTNAME, not the hostID at all. Verified against MA 2.9.13.
+
+        Prefer the id over the name. The name is the machine's hostname and
+        changes with it, while the id derives from the hostID this module pins
+        (snapclient otherwise names itself after the MAC address of whatever
+        interface it picks, which is worse than either).
+
+        If you get this wrong the service starts, connects, authenticates, and
+        reports `player_error: no MA player matches ...` in GET /health while
+        every playback endpoint returns 503. Check /health first.
 
         Required. There is no sensible default, and guessing one would mean the
         service starts happily and controls nothing.
@@ -751,6 +766,17 @@ in
         partOf = [ "bluetooth.service" ];
 
         serviceConfig = {
+          # bluealsa keeps per device state, most usefully the last volume, in a
+          # storage directory, and the packaged unit declares nowhere for it to
+          # live. Without this it logs
+          #   bluealsa: W: Couldn't create storage directory: No such file or directory
+          # on every start and silently forgets the speaker's volume across
+          # restarts, so the first track after a reboot comes back at whatever
+          # the transport negotiates instead of where you left it. Observed on a
+          # pi5 on 2026-08-15. Harmless enough to ship unnoticed, which is
+          # exactly why it is worth naming.
+          StateDirectory = "bluealsa";
+
           # systemd needs the empty string first to clear the packaged
           # ExecStart before a new one can be set.
           ExecStart = [

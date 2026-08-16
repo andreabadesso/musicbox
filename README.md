@@ -247,9 +247,13 @@ services.musicbox = {
   host = "0.0.0.0";
   port = 8099;
 
-  # Player name as it appears in the Music Assistant UI. snapclient is started
-  # with --hostID musicbox, so this is stable across hardware changes.
-  player = "musicbox";
+  # The player ID in Music Assistant. snapclient is started with
+  # --hostID musicbox, and MA registers that as `ma_musicbox/pi5`: the id gets
+  # an `ma_` prefix and the display name is the client's HOSTNAME. Use the id,
+  # since the name follows the hostname and changes with it. Get this wrong and
+  # /health says `player_error: no MA player matches ...` while everything else
+  # looks healthy.
+  player = "ma_musicbox";
 
   maUrl = "http://127.0.0.1:8095";
   sfxDir = "/var/lib/musicbox/sfx";
