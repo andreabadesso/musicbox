@@ -63,6 +63,65 @@ QUEUE = {
 }
 
 
+TRACK = {
+    "item_id": "57HLbw5C35P2CjpNJ9ALuS",
+    # The provider instance id, suffix and all. It is what the uri scheme is
+    # built from, and hardcoding a bare "spotify" anywhere is the bug this
+    # fixture is shaped to catch.
+    "provider": "spotify--asK7Swun",
+    "name": "Sun In Your Eyes",
+    "version": "",
+    "uri": "spotify--asK7Swun://track/57HLbw5C35P2CjpNJ9ALuS",
+    "is_playable": True,
+    "media_type": "track",
+    "duration": 291.026,
+    "artists": [{"name": "Above & Beyond", "media_type": "artist"}],
+    "album": {"name": "Group Therapy", "year": 2011},
+    "provider_mappings": [{"provider_instance": "spotify--asK7Swun", "available": True}],
+}
+
+# SearchResults as it really comes off the wire: every key present, every one a
+# list, `radio` singular and `genres` in the middle. Nothing here should ever
+# assume the plural is uniform.
+EMPTY_SEARCH = {
+    "artists": [],
+    "albums": [],
+    "genres": [],
+    "tracks": [],
+    "playlists": [],
+    "radio": [],
+    "audiobooks": [],
+    "podcasts": [],
+}
+
+QUEUE_ITEMS = [
+    {
+        "queue_id": "snapcast_musicbox",
+        "queue_item_id": f"qi{i}",
+        "name": f"Above & Beyond - Track {i}",
+        "duration": 291,
+        # Deliberately scrambled, and NOT equal to the ordinal. The live box
+        # returned ordinals 0 to 7 carrying sort_index 0, 1, 2, 6, 4, 14, 18, 22
+        # with shuffle off, because sort_index is stamped on add or move and
+        # never renumbered. This fake used to say `i` here, which let a bug
+        # through: position was read off sort_index and every number after the
+        # third was wrong. Keep these values ugly.
+        "sort_index": (0, 1, 2, 6, 4)[i],
+        # Always 0 on every item, at every position, so it is never the answer.
+        "index": 0,
+        "available": True,
+        "media_item": {
+            "name": f"Track {i}",
+            "version": "",
+            "uri": f"spotify--asK7Swun://track/t{i}",
+            "artists": [{"name": "Above & Beyond"}],
+            "album": {"name": "Group Therapy"},
+        },
+    }
+    for i in range(5)
+]
+
+
 class FakeError(Exception):
     def __init__(self, code: int, details: str) -> None:
         super().__init__(details)
@@ -89,6 +148,30 @@ class FakeMA:
         self.player = dict(PLAYER)
         self.queue = dict(QUEUE)
         self.resolve_by_id = True
+        self.tracks = [dict(TRACK)]
+        self.queue_items = list(QUEUE_ITEMS)
+
+        def music_search(args: dict) -> Any:
+            # Mirrors the real server closely enough to matter: a bad
+            # media_types value is an error rather than an empty result, and
+            # limit is applied per media type.
+            types = args.get("media_types")
+            if not isinstance(types, list) or not types:
+                raise FakeError(12, "media_types must be a list")
+            limit = int(args.get("limit", 25))
+            results = dict(EMPTY_SEARCH)
+            if "track" in types and args.get("search_query"):
+                results["tracks"] = self.tracks[:limit]
+            return results
+
+        def queue_items(args: dict) -> Any:
+            if args.get("queue_id") != self.queue["queue_id"]:
+                # An unknown queue_id is [] and not an error, which is exactly
+                # why an empty list alone cannot be trusted.
+                return []
+            offset = int(args.get("offset", 0))
+            limit = int(args.get("limit", 500))
+            return self.queue_items[offset : offset + limit]
 
         def player_get(args: dict) -> Any:
             if not self.resolve_by_id:
@@ -115,6 +198,8 @@ class FakeMA:
                 "players/get": player_get,
                 "players/get_by_name": player_get_by_name,
                 "player_queues/get_active_queue": lambda args: self.queue,
+                "player_queues/items": queue_items,
+                "music/search": music_search,
                 "player_queues/play_media": lambda args: None,
                 "player_queues/pause": lambda args: None,
                 "player_queues/resume": lambda args: None,

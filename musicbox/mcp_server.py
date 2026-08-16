@@ -33,20 +33,31 @@ import json
 import os
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import aiohttp
+from fastapi import HTTPException
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from . import __version__
 from .app import (
     OVER_NOTE,
+    QUEUE_PAGE_DEFAULT,
+    QUEUE_POSITION_DEFAULT,
+    QUEUE_POSITIONS,
+    SEARCH_LIMIT_DEFAULT,
+    NoPlayableMatch,
+    RequestLane,
     do_reconnect,
     list_sfx,
+    looks_like_uri,
     now_snapshot,
     perform_drop,
+    perform_media,
+    queue_snapshot,
     resolve_sfx,
+    search_media,
     sfx_base_url_from_config,
     sfx_file_url,
 )
@@ -61,11 +72,30 @@ MCP_PATH = "/mcp"
 MODES = ("over", "cut")
 
 INSTRUCTIONS = """\
-Controls the music box: one Bluetooth speaker driven by Music Assistant.
+Controls the music box: one Bluetooth speaker driven by Music Assistant. It is
+a jukebox. People ask for songs by name, so the normal path is to pass what they
+said straight to queue.
 
-play and queue take a provider URI (spotify://track/xyz) or a plain http(s) URL
-to an audio file. play replaces whatever is queued and starts now; queue adds
-to the end.
+play and queue take plain text ("Above and Beyond Sun in Your Eyes"), a provider
+URI (spotify://track/xyz), or an http(s) URL to an audio file. Plain text is
+searched and the first playable match is used, and the answer names what it
+found so you can read it back and be corrected. Use search first only when you
+want to choose between versions; otherwise queue the text directly and save a
+round trip.
+
+queue is the answer to a request. play is the exception: it stops the current
+song and throws the rest of the queue away, so it is for starting a set, not for
+honoring "toca essa". The box usually has a long background playlist loaded, so
+a plain queue can put a request hours away. Pass position "fair" for a person's
+request: it lands after the other requests and in front of the filler, and
+several people asking are played in the order they asked. position "next" jumps
+the whole line, so use it only when somebody really has to be served first.
+
+Asking twice is normal at a party and is not an error. If the track is already
+waiting, queue adds nothing and tells you where it is, so you can say how many
+songs away it is. Pass force true to queue it a second time on purpose.
+
+get_queue shows what is coming up, current track first.
 
 drop and sfx fire a one shot sound. mode "over" hands it to Music Assistant's
 announcement path; mode "cut" pauses the music, plays the sound, and resumes
@@ -87,14 +117,38 @@ class ToolFailure(Exception):
     """
 
 
-def explain(exc: Exception) -> str:
+def explain(exc: Exception, tail: str = "Nothing was played.") -> str:
     """Every failure a tool can produce, as something a model can act on.
 
     Each sentence says what did NOT happen and what to try, because the model
     reading it cannot see the journal and is usually mid-event.
+
+    `tail` is that "what did not happen" clause, and it is a parameter because
+    two of these tools do not play anything. A failed search answering "Nothing
+    was played" reads as a failed PLAY, and a model that believes a play failed
+    goes and retries the play, which is how somebody's typo turns into an
+    interruption of whatever was on.
     """
     if isinstance(exc, ToolFailure):
         return str(exc)
+    if isinstance(exc, NoPlayableMatch):
+        # Already a full sentence naming the query, written for exactly this
+        # reader. Adding anything would only bury it.
+        return str(exc)
+    if isinstance(exc, HTTPException):
+        # The service layer validates arguments with HTTPException because HTTP
+        # is its other caller. Over MCP there is no status code to show, so only
+        # the detail is worth saying.
+        #
+        # The period is added here because those details are written as HTTP
+        # `detail` values and do not carry one ("limit must be a number, got
+        # 'lots'"). Gluing the tail straight on ran the two together into
+        # "...got 'lots' Nothing was searched.", which reads as one broken
+        # sentence to the only reader this string has.
+        detail = str(exc.detail).strip()
+        if detail and detail[-1] not in ".!?":
+            detail += "."
+        return f"{detail} {tail}"
     if isinstance(exc, MANotConnected):
         return (
             "Music Assistant is not reachable, so nothing happened. "
@@ -110,12 +164,12 @@ def explain(exc: Exception) -> str:
     if isinstance(exc, MAError):
         return (
             f"Music Assistant refused the command: {exc.details} "
-            f"(error code {exc.code}). Nothing was played."
+            f"(error code {exc.code}). {tail}"
         )
     # Deliberately last and deliberately loud about the type. If this arm is
     # ever hit it is a musicbox bug, and the model naming the exception class
     # in its report is what makes it findable afterwards.
-    return f"musicbox hit an unexpected {type(exc).__name__}: {exc}. Nothing was played."
+    return f"musicbox hit an unexpected {type(exc).__name__}: {exc}. {tail}"
 
 
 def _mode(raw: str | None) -> str:
@@ -128,8 +182,29 @@ def _mode(raw: str | None) -> str:
 def _media(raw: str) -> str:
     media = (raw or "").strip()
     if not media:
-        raise ToolFailure("Give a provider URI or an http(s) URL. Nothing was played.")
+        raise ToolFailure(
+            "Give the name of a song, a provider URI, or an http(s) URL. Nothing was played."
+        )
     return media
+
+
+def _position(raw: str | None) -> str:
+    """The position name, checked here so a wrong one is a sentence.
+
+    The service layer validates it too, and raises an HTTPException that explain
+    turns into the same words. This exists so that the check happens before the
+    track is resolved: a search costs a Spotify round trip, and spending it to
+    then refuse the argument is a second of an event wasted for nothing.
+    """
+    name = (raw or "").strip().lower()
+    if not name:
+        return QUEUE_POSITION_DEFAULT
+    if name not in QUEUE_POSITIONS:
+        raise ToolFailure(
+            f"position must be one of {', '.join(QUEUE_POSITIONS)}, not {raw!r}. "
+            "Nothing was queued."
+        )
+    return name
 
 
 def _http_url(raw: str) -> str:
@@ -152,17 +227,33 @@ def _http_url(raw: str) -> str:
 class LocalBackend:
     """Calls the service layer in app.py in this same process."""
 
-    def __init__(self, config: Config, ma: MAClient) -> None:
+    def __init__(self, config: Config, ma: MAClient, lane: RequestLane | None = None) -> None:
         self._config = config
         self._ma = ma
+        # Passed in by create_app so the HTTP routes and these tools share one
+        # request lane. The fallback keeps a standalone LocalBackend (tests, and
+        # any future embedding) working; it just means its "fair" ordering only
+        # knows about what it queued itself.
+        self._lane = lane or RequestLane()
 
-    async def play(self, media: str) -> None:
+    async def play(self, media: str) -> dict[str, Any]:
         # "replace", not "play": replace clears the queue, which is what "play
-        # now, replacing the queue" means. Same call POST /play makes.
-        await self._ma.play_media(media, "replace")
+        # now, replacing the queue" means. Same call POST /play makes, resolver
+        # included, so free text means the same thing on both surfaces.
+        return await perform_media(self._ma, media, "replace")
 
-    async def enqueue(self, media: str) -> None:
-        await self._ma.play_media(media, "add")
+    async def enqueue(
+        self, media: str, position: str | None = None, force: bool = False
+    ) -> dict[str, Any]:
+        return await perform_media(
+            self._ma, media, position or QUEUE_POSITION_DEFAULT, force=force, lane=self._lane
+        )
+
+    async def search(self, query: str, media_type: str, limit: int) -> dict[str, Any]:
+        return await search_media(self._ma, query, media_type=media_type, limit=limit)
+
+    async def get_queue(self, limit: int) -> dict[str, Any]:
+        return await queue_snapshot(self._ma, limit=limit)
 
     async def drop(self, url: str, mode: str) -> dict[str, Any]:
         return await perform_drop(self._ma, url, mode)
@@ -283,11 +374,38 @@ class HttpBackend:
                 "playing the sound; check now_playing before retrying."
             ) from exc
 
-    async def play(self, media: str) -> None:
-        await self._request("POST", "/play", {"uri": media})
+    def _media_body(self, media: str) -> dict[str, str]:
+        # Classified here as well as on the server, and not because the server
+        # needs the help: it re-classifies whatever arrives in whichever field.
+        # This is so the request in the musicbox journal says which of the two
+        # things the caller meant, which is the difference between debugging a
+        # bad search and debugging a bad URI.
+        return {"uri": media} if looks_like_uri(media) else {"query": media}
 
-    async def enqueue(self, media: str) -> None:
-        await self._request("POST", "/queue", {"uri": media})
+    async def play(self, media: str) -> dict[str, Any]:
+        return await self._request("POST", "/play", self._media_body(media))
+
+    async def enqueue(
+        self, media: str, position: str | None = None, force: bool = False
+    ) -> dict[str, Any]:
+        body = self._media_body(media)
+        # Sent only when they are not the defaults, so this proxy keeps working
+        # against a musicbox older than enqueue positions: an unknown key in the
+        # body is ignored by FastAPI, but an older server would silently drop a
+        # position it does not understand, and sending nothing is the same
+        # request that server has always answered correctly.
+        if position:
+            body["position"] = position
+        if force:
+            body["force"] = True
+        return await self._request("POST", "/queue", body)
+
+    async def search(self, query: str, media_type: str, limit: int) -> dict[str, Any]:
+        params = urlencode({"q": query, "type": media_type, "limit": limit})
+        return await self._request("GET", f"/search?{params}")
+
+    async def get_queue(self, limit: int) -> dict[str, Any]:
+        return await self._request("GET", f"/queue?{urlencode({'limit': limit})}")
 
     async def drop(self, url: str, mode: str) -> dict[str, Any]:
         return await self._request("POST", "/drop", {"url": url, "mode": mode})
@@ -342,6 +460,166 @@ def _describe_drop(result: dict[str, Any], what: str) -> str:
     return line
 
 
+def _label(entry: dict[str, Any]) -> str:
+    title = entry.get("title") or "an untitled track"
+    artist = entry.get("artist")
+    return f"{title} by {artist}" if artist else title
+
+
+def _short(text: Any, limit: int = 120) -> Any:
+    """A caller's own words, bounded, for echoing back in a failure.
+
+    Only ever used on the ERROR path. A tool that quotes a rejected argument
+    back verbatim turns a 20 kB argument into 20 kB of the context window that
+    produced it, which is the one context a model can least afford to spend
+    while it is being told it got something wrong.
+    """
+    if isinstance(text, str) and len(text) > limit:
+        return text[:limit] + f"... ({len(text)} characters)"
+    return text
+
+
+def _wait_phrase(result: dict[str, Any]) -> str:
+    """"plays in N songs", when N is actually known.
+
+    plays_after is the number of tracks in front of it counted from the AUDIBLE
+    one, which is what somebody standing next to the speaker is asking about. It
+    is None whenever the landing slot could not be confirmed, and in that case
+    this says nothing rather than guessing a number that a person will then be
+    told out loud.
+    """
+    waiting = result.get("plays_after")
+    if not isinstance(waiting, int):
+        return ""
+    if waiting <= 0:
+        return " It is next."
+    if waiting == 1:
+        return " It plays after the current song."
+    return f" It plays in {waiting} songs."
+
+
+def _describe_media(result: dict[str, Any]) -> str:
+    """What play and queue answer with.
+
+    When free text was resolved the sentence names the match AND the words that
+    were searched for. Both halves matter: the person who asked can only correct
+    a wrong guess if they hear what the guess was, and the model can only
+    apologize usefully if it knows which of its words led there.
+    """
+    action = result.get("action")
+    resolved = result.get("resolved")
+    query = result.get("query")
+    what = _label(resolved) if resolved else (result.get("media") or "it")
+    matched = f", matched from {query!r}" if resolved and query else ""
+
+    if action == "already_queued":
+        # ok: true, nothing was enqueued, and the sentence has to make both of
+        # those obvious in one read. A model that reads this as a failure will
+        # retry with force and put the song in twice, which is the thing the
+        # check exists to stop.
+        if result.get("already_playing"):
+            # The copy is the track the box is ON, not one waiting. This used to
+            # come out as "already in the queue at position 5. It is next.",
+            # which told the room a song was coming that was in fact seconds
+            # from over. Different fact, different sentence.
+            return (
+                f"{what} is playing right now, at queue position "
+                f"{result.get('queue_position')}. Nothing was added: it is not waiting "
+                "in the queue, it is already on. Tell the person it is the song they "
+                "are hearing. If they want it AGAIN after this one, call queue again "
+                "with force true."
+            )
+        line = f"{what} is already in the queue at position {result.get('queue_position')}."
+        line += _wait_phrase(result)
+        check = result.get("duplicate_check") or {}
+        line += (
+            " Nothing was added. Tell the person it is already coming. If they want it "
+            "again anyway, call queue again with force true."
+        )
+        if check.get("exhaustive") is False:
+            line += (
+                f" (Only the next {check.get('checked')} of {check.get('upcoming')} "
+                "upcoming tracks were checked.)"
+            )
+        return line
+
+    if action == "playing":
+        tail = (
+            " The previous queue was cleared."
+            if result.get("queue_cleared")
+            else " The rest of the queue is untouched."
+        )
+        line = f"Playing {what} now{matched}.{tail}"
+        if resolved:
+            line += " If that is the wrong track, say so and search for another."
+        return line
+
+    position = result.get("position") or "end"
+    if position == "end":
+        placed = " It plays after everything already in the queue."
+    elif position == "fair":
+        placed = " It plays after the other requests and before the background playlist."
+    else:
+        placed = ""
+    line = f"Queued {what}{matched}.{placed}{_wait_phrase(result)}"
+    note = result.get("note")
+    if note:
+        line += f" {note}"
+    if resolved:
+        line += " If that is the wrong track, say so and search for another."
+    return line
+
+
+def _describe_search(found: dict[str, Any]) -> dict[str, Any]:
+    """A search result list small enough to sit in a context window.
+
+    Album art, provider mapping ids, external ids and per-provider audio formats
+    are all dropped. The uri is kept because it is the one field the model has
+    to hand back to play or queue to pick a specific version.
+    """
+    return {
+        "query": found.get("query"),
+        "type": found.get("type"),
+        "count": found.get("count", 0),
+        "results": [
+            {
+                "title": item.get("title"),
+                "artist": item.get("artist"),
+                "album": item.get("album"),
+                "uri": item.get("uri"),
+                "duration_seconds": item.get("duration"),
+                "playable": item.get("playable"),
+            }
+            for item in found.get("results") or []
+        ],
+    }
+
+
+def _describe_queue(snapshot: dict[str, Any]) -> dict[str, Any]:
+    items = snapshot.get("items") or []
+    return {
+        "state": snapshot.get("state") or "unknown",
+        # total is the whole queue including what has already played, upcoming
+        # is what is left, and showing is how many are in this answer. They
+        # differ constantly and conflating them is how somebody gets told their
+        # song is next when it is ninetieth.
+        "total": snapshot.get("count", 0),
+        "upcoming": snapshot.get("upcoming", 0),
+        "showing": len(items),
+        "now_playing_index": snapshot.get("index"),
+        "items": [
+            {
+                "position": item.get("position"),
+                "title": item.get("title"),
+                "artist": item.get("artist"),
+                "duration_seconds": item.get("duration"),
+                "uri": item.get("uri"),
+            }
+            for item in items
+        ],
+    }
+
+
 def _describe_now(snapshot: dict[str, Any]) -> dict[str, Any]:
     track = snapshot.get("track") or {}
     position = snapshot.get("position")
@@ -376,33 +654,192 @@ def register_tools(mcp: FastMCP, backend: Any) -> None:
     are written for someone who has never seen this repo.
     """
 
+    # play and queue keep the single `uri_or_url` parameter they have always
+    # had, widened rather than joined by a second one. A model choosing between
+    # `uri_or_url` and a `query` sibling has to guess which of the two a string
+    # belongs in, and it will guess wrong on a share URL. One parameter that
+    # accepts everything cannot be filled in wrong.
     @mcp.tool()
     async def play(uri_or_url: str) -> str:
         """Start playing something right now, clearing whatever was queued.
 
-        Takes a provider URI such as spotify://track/xyz, or a plain http(s)
-        URL to an audio file. Use queue instead to add without interrupting.
+        Takes any of three things:
+          * plain text, for example "Above and Beyond Sun in Your Eyes", or
+            whatever the person actually said. It is searched across every music
+            provider on the box and the first playable match is played.
+          * a provider URI, for example spotify://track/xyz, or one copied from
+            a search result.
+          * an http(s) URL to an audio file.
+
+        Anything without a scheme is treated as text to search for, so you can
+        pass a request through verbatim. The answer names the track it landed on
+        and the words it searched for. Read it back to the person who asked:
+        search picks one match out of several and it can pick the wrong one, and
+        they are the only one who knows.
+
+        play is the EXCEPTION, not the normal path. It interrupts: the current
+        song stops and everything else that was waiting is thrown away. Use
+        queue for a song somebody asked for, with position "fair" so it plays
+        soon without wiping the evening's music. Reach for play only when the
+        whole queue is meant to go, for example starting a set from scratch.
         """
         try:
-            media = _media(uri_or_url)
-            await backend.play(media)
-            return f"Playing {media} now. The previous queue was cleared."
+            return _describe_media(await backend.play(_media(uri_or_url)))
         except Exception as exc:  # noqa: BLE001 - a tool never raises
             return explain(exc)
 
     @mcp.tool()
-    async def queue(uri_or_url: str) -> str:
-        """Add something to the end of the queue without interrupting the music.
+    async def queue(
+        uri_or_url: str,
+        position: str | None = None,
+        force: bool | None = False,
+    ) -> str:
+        """Add a song to the queue. This is the normal way to honor a request.
 
-        Takes a provider URI such as spotify://track/xyz, or a plain http(s)
-        URL to an audio file. Use play instead to start it immediately.
+        Someone asks for a song, you call queue. Use play only when something has
+        to start this second, because play cuts off whatever is on and clears
+        everything else that was waiting. At an event that is almost never what
+        anybody wants.
+
+        uri_or_url takes exactly what play takes: plain text such as "toca Baile
+        de Favela" or just "Baile de Favela", a provider URI such as
+        spotify://track/xyz, or an http(s) URL to an audio file. Text is searched
+        and the first playable match is queued. The answer names the track and
+        the words it was matched from, so read it back to whoever asked.
+
+        position decides where it lands, and it matters more than it sounds. The
+        queue often holds a long background playlist, so the default sends a
+        request behind all of it and it may not play for hours:
+
+          "fair" (use this for a person's request) puts it after the other
+              requests already waiting and in front of the background playlist.
+              Ten people who ask get played in the order they asked.
+          "next" plays it immediately after the current song, jumping ahead of
+              every request already waiting. Use it when somebody has to be
+              served right now, and know that it pushes back everyone who asked
+              earlier. If the current song is nearly over it lands after the
+              following one instead.
+          "end" (the default) adds it after everything already queued. Right for
+              filling a quiet box, wrong for a request when a long playlist is
+              loaded: read `plays in N songs` in the answer before promising
+              anybody anything.
+          "now" starts it immediately, cutting off the current song, and leaves
+              the rest of the queue alone.
+          "replace" throws the whole queue away and starts this instead.
+
+        If the same track is already waiting further down the queue, nothing is
+        added: the answer says it is already queued and how long the wait is, so
+        you can tell the person "essa ja esta na fila, toca em 3 musicas". If it
+        is the song playing at that moment the answer says that instead. Only
+        what is still to play counts, so a song that already played is not a
+        duplicate. To queue it a second time on purpose, call again with
+        force true.
+
+        That check reads the next 50 upcoming tracks and not the whole queue, so
+        on a long queue a copy sitting further down than that is not found and
+        the song is queued again. "Queued" therefore means "not already coming in
+        the next 50", not "definitely not in the queue". When a duplicate IS
+        found the answer says how much was checked.
         """
         try:
-            media = _media(uri_or_url)
-            await backend.enqueue(media)
-            return f"Queued {media}. It plays after what is already in the queue."
+            wanted = _media(uri_or_url)
+            where = _position(position)
+            return _describe_media(
+                await backend.enqueue(wanted, where, bool(force))
+            )
         except Exception as exc:  # noqa: BLE001
             return explain(exc)
+
+    # `limit: int | float | str | None` on this tool and on get_queue, for the
+    # same reason set_volume takes a union: pydantic validates the arguments
+    # BEFORE the body runs, so a plain `int` never reached the careful coercion
+    # in the service layer. limit=5.5 and limit="all" both came back as "1
+    # validation error for searchArguments", which is the pydantic dump this
+    # whole module exists to keep away from the model, and it is the one shape
+    # of failure a tool here is not allowed to have. Widened, both reach
+    # coerce_limit: 5.5 rounds, "all" gets a sentence.
+    @mcp.tool()
+    async def search(
+        query: str,
+        type: str | None = "track",
+        limit: int | float | str | None = None,
+    ) -> dict[str, Any]:
+        """Find something to play, by name, across every provider on the box.
+
+        query is free text: a song title, an artist, or both. Formatting it as
+        "Artist - Title" measurably improves the ordering, because Music
+        Assistant scores an exact title match and hoists it to the top.
+
+        type is one of track, album, artist or playlist. Default track.
+        limit defaults to 5 and is capped at 10. Asking for more is genuinely
+        slower: results come from Spotify ten at a time behind a rate limiter,
+        so 5 takes about a second and 11 takes four.
+
+        Returns a list with a uri on each entry. Hand that uri to play or queue
+        to pick one exactly. You do NOT have to search first: play and queue
+        take plain text themselves and do this same search. Search when you want
+        to choose between versions, show someone the options, or check whether a
+        song exists at all.
+
+        `playable` false means Music Assistant knows the track but cannot play
+        it here, usually a region or account restriction. Do not queue those.
+        An empty list means nothing matched, or that a provider is down; the two
+        are indistinguishable from here.
+        """
+        try:
+            wanted = (query or "").strip()
+            if not wanted:
+                raise ToolFailure("Give something to search for. Nothing was searched.")
+            found = await backend.search(
+                wanted,
+                (type or "track").strip().lower(),
+                SEARCH_LIMIT_DEFAULT if limit is None else limit,
+            )
+            return _describe_search(found)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "query": _short(query),
+                "count": 0,
+                "results": [],
+                # Not the default tail. A search that fails has not played
+                # anything and has not failed to play anything either, and
+                # telling a model "Nothing was played" here sends it to fix the
+                # wrong thing.
+                "error": explain(exc, "Nothing was searched."),
+            }
+
+    @mcp.tool()
+    async def get_queue(limit: int | float | str | None = None) -> dict[str, Any]:
+        """What is coming up, current track first.
+
+        `total` is the whole queue length, `upcoming` is how many are still to
+        play, and `showing` is how many are in this answer. They are three
+        different numbers: read `upcoming` before telling someone how long the
+        wait is, not the length of the list.
+
+        `position` on an item is its real index in the whole queue, counting
+        from 0. The first item returned is the current one, so its position
+        equals `now_playing_index`, and how long someone waits is their position
+        minus that. Do not expect this number anywhere else: Music Assistant's
+        own per item sort index is stamped when a track is added and never
+        renumbered, so it disagrees with the real order.
+
+        `uri` is null on an item that has none, which is what a raw stream
+        queued by URL looks like. A null there means you cannot re-queue that
+        item by uri, not that something is broken. Search for it by name.
+        """
+        try:
+            return _describe_queue(
+                await backend.get_queue(QUEUE_PAGE_DEFAULT if limit is None else limit)
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "total": 0,
+                "upcoming": 0,
+                "showing": 0,
+                "items": [],
+                "error": explain(exc, "The queue could not be read."),
+            }
 
     # `mode: str | None` and not `mode: str`, here and on sfx. The argument
     # schema is enforced by pydantic BEFORE the function body runs, so with a
@@ -606,9 +1043,9 @@ class MountedMCP:
     handed a Request, and the streamable HTTP protocol needs the raw triple.
     """
 
-    def __init__(self, config: Config, ma: MAClient) -> None:
+    def __init__(self, config: Config, ma: MAClient, lane: RequestLane | None = None) -> None:
         self.mcp = build_mcp(
-            LocalBackend(config, ma),
+            LocalBackend(config, ma, lane),
             # Stateless: no session id to track, nothing to expire, and a
             # client that drops off the tailnet and comes back does not have to
             # be told its session is gone. We send no server initiated

@@ -53,8 +53,12 @@ COMMANDS = {
     "player_get_by_name": "players/get_by_name",
     "player_volume_set": "players/cmd/volume_set",
     "player_play_announcement": "players/cmd/play_announcement",
+    "music_search": "music/search",
     "queue_get_active": "player_queues/get_active_queue",
+    "queue_items": "player_queues/items",
     "queue_play_media": "player_queues/play_media",
+    "queue_move_item": "player_queues/move_item",
+    "queue_delete_item": "player_queues/delete_item",
     "queue_pause": "player_queues/pause",
     "queue_resume": "player_queues/resume",
     "queue_next": "player_queues/next",
@@ -64,8 +68,48 @@ COMMANDS = {
 # QueueOption values, exactly as the server enum spells them. An unknown value
 # does NOT error: QueueOption._missing_ returns UNKNOWN and play_media becomes a
 # silent no-op that still answers 200. So the value is validated before it is
-# sent, never after.
+# sent, never after. Same reason `option` is always sent explicitly and is never
+# left to MA's default of None, which is that same silent no-op.
+#
+# What each one does to an EXISTING queue, read out of _enqueue_with_option in
+# music_assistant/controllers/player_queues.py on the running 2.9.13 image:
+#   add          append to the end when shuffle is off. When shuffle_enabled is
+#                ON it inserts after the current item and RESHUFFLES the tail,
+#                so the landing slot is not knowable from out here.
+#   next         insert right after the current (or currently buffered) item.
+#   play         insert after the current item, then play that slot now, which
+#                cuts the current song off.
+#   replace      clear the whole queue, load, and start from index 0.
+#   replace_next insert after the current item and DELETE everything that came
+#                after it. musicbox never sends this one. See QUEUE_POSITIONS
+#                in app.py for why it is not exposed.
 QUEUE_OPTIONS = frozenset({"play", "replace", "next", "replace_next", "add"})
+
+# There is NO insert-at-arbitrary-index command. PlayerQueues.load() takes an
+# insert_at_index and would be exactly right, but it carries no @api_command
+# decorator and does not appear in the 238 commands the live box publishes, so
+# it cannot be reached over the websocket. move_item below is the way in: it
+# takes a RELATIVE shift, so an absolute target T is reached with
+# pos_shift = T - current_list_index. app.py builds the fair request lane on
+# that, by appending and then moving up.
+
+# MediaType values musicbox is willing to search for. MA accepts more (radio,
+# audiobook, podcast, genre and a pile of internal ones), but this list is what
+# the /search contract promises and an unknown value is not a clean error: MA
+# answers a WS error, and over its HTTP API a bad media_types value is a plain
+# text 500 with no code at all. So the value is validated here, before it is
+# sent, exactly like QUEUE_OPTIONS above.
+SEARCH_MEDIA_TYPES = ("track", "album", "artist", "playlist")
+
+# Hard ceiling on the per-type search limit, and it is a latency guard rather
+# than a taste judgement. MA pages Spotify 10 at a time SEQUENTIALLY
+# (providers/spotify/provider.py: page_limit = min(limit, 10)) through a
+# throttler that allows one Spotify request every 2 seconds on MA's shared
+# client id. Measured on the live box: limit 5 cold 1.32 s, limit 10 cold
+# 1.78 s, limit 11 cold 4.15 s. One caller asking for 50 would be five
+# sequential throttled calls and would blow past command_timeout, which the
+# caller then reads as "the box is broken".
+SEARCH_LIMIT_MAX = 10
 
 # Error codes from music_assistant_models.errors that the app reacts to.
 ERR_MEDIA_NOT_FOUND = 2
@@ -78,6 +122,15 @@ ERR_AUTH_REQUIRED = 20
 ERR_AUTH_FAILED = 21
 ERR_INSUFFICIENT_PERMISSIONS = 22
 ERR_INVALID_TOKEN = 23
+
+# Not from that module. Anything MA raises that is not a MusicAssistantError is
+# mapped to 999 by the websocket handler, with the exception text as `details`.
+# move_item's refusal to touch a buffered item arrives that way, as a bare
+# IndexError, so 999 is a NORMAL outcome here and not a crash. See move_item.
+ERR_UNEXPECTED = 999
+
+# The text MA puts in that 999 when the item is at or before index_in_buffer.
+BUFFERED_DETAIL = "already played/buffered"
 
 AUTH_ERRORS = frozenset({ERR_AUTH_REQUIRED, ERR_AUTH_FAILED, ERR_INVALID_TOKEN})
 
@@ -569,13 +622,117 @@ class MAClient:
             raise MANotConnected("player has no active queue")
         return str(queue["queue_id"])
 
-    async def play_media(self, media: str, option: str) -> None:
+    async def queue_items(self, queue_id: str, limit: int = 20, offset: int = 0) -> list:
+        """A window of the queue, in queue order.
+
+        queue_id is passed in rather than resolved here because every caller
+        already had to fetch the PlayerQueue to learn current_index, and asking
+        for the active queue twice doubles the round trips for one listing.
+
+        Two things this call will NOT tell you. An unknown queue_id returns []
+        rather than an error (verified live), so an empty list means "empty
+        queue" or "wrong queue" and only the PlayerQueue's own `items` count can
+        separate them. And the list includes items that have already played, so
+        the upcoming window starts at offset = current_index.
+        """
+        return await self._call(
+            COMMANDS["queue_items"],
+            {"queue_id": queue_id, "limit": int(limit), "offset": int(offset)},
+        ) or []
+
+    async def search(self, query: str, media_type: str = "track", limit: int = 5) -> dict:
+        """Ask MA to search every provider it has for `query`.
+
+        Returns the raw SearchResults dict. The keys are per media type and are
+        NOT what you would guess: `tracks`, `albums`, `artists`, `playlists`,
+        `genres`, and `radio` (singular). Read them all with .get(key, []),
+        because which keys exist varies with the server version.
+
+        Exactly one media type is sent, never MA's default of all eight. On the
+        live box all eight cost 5.37 s cold against 1.32 s for tracks alone, and
+        nothing here ever wants the other seven at once.
+
+        MA caches results for 600 s on a key built from the query string, the
+        media types, the limit and library_only. The query is therefore passed
+        through byte for byte with only the outer whitespace stripped: lowering
+        or re-spacing it on one path and not another turns a 5 ms cache hit into
+        another 1.3 s of Spotify. Same reason the resolver and /search use the
+        same default limit, so one warms the other.
+        """
+        if media_type not in SEARCH_MEDIA_TYPES:
+            raise ValueError(f"invalid media type {media_type!r}")
+        limit = max(1, min(int(limit), SEARCH_LIMIT_MAX))
+        result = await self._call(
+            COMMANDS["music_search"],
+            {"search_query": query, "media_types": [media_type], "limit": limit},
+        )
+        return result if isinstance(result, dict) else {}
+
+    async def play_media(self, media: str, option: str, queue_id: str | None = None) -> None:
+        """Resolve `media` and put it in the queue the way `option` says.
+
+        queue_id is an argument so a caller that has ALREADY fetched the
+        PlayerQueue (to read current_index, or to check for a duplicate) does not
+        pay for a second get_active_queue. It also closes a race: the fair lane
+        computes a target index against one queue and must enqueue into that same
+        queue, not into whatever became active in between.
+
+        MA answers null. There is no way to learn the queue_item_id of what was
+        just added except by reading the queue back, which is what the fair lane
+        does.
+        """
         if option not in QUEUE_OPTIONS:
             raise ValueError(f"invalid queue option {option!r}")
-        queue_id = await self.require_queue_id()
+        queue_id = queue_id or await self.require_queue_id()
         await self._call(
             COMMANDS["queue_play_media"],
             {"queue_id": queue_id, "media": media, "option": option, "radio_mode": False},
+        )
+
+    async def move_item(self, queue_id: str, queue_item_id: str, pos_shift: int) -> None:
+        """Move one item by a RELATIVE number of slots. Negative moves it up.
+
+        The index MA counts in is the position in the list player_queues/items
+        returns, played items included. It is neither `sort_index` nor the item's
+        own `index` field, and both of those are decoys: sort_index is only an
+        un-shuffle key and is never renumbered, and `index` is 0 on every item on
+        the live box, including the two hundredth.
+
+        Two refusals to plan for, and only one of them is loud:
+
+          * An item at or before index_in_buffer raises a bare IndexError, which
+            reaches us as MAError(999, "<n> is already played/buffered"). Near a
+            track boundary this can happen to an item that was legal a second
+            ago, so callers treat it as an expected outcome.
+          * A destination outside current_index..len(items) is a SILENT no-op.
+            MA returns null and nothing moved. So any caller that cares where the
+            item ended up has to read the queue back and look, rather than
+            trusting the reply.
+
+        pos_shift 0 is special in MA (it means "top of the queue") and is not a
+        no-op, so a caller with nothing to move must not call this at all.
+        """
+        await self._call(
+            COMMANDS["queue_move_item"],
+            {"queue_id": queue_id, "queue_item_id": queue_item_id, "pos_shift": int(pos_shift)},
+        )
+
+    async def delete_item(self, queue_id: str, item_id: str) -> None:
+        """Remove one item from the queue, by queue_item_id.
+
+        MA accepts an int index here too. musicbox always passes the id string:
+        an index shifts the moment anything else touches the queue, and the
+        failure mode of getting it wrong is deleting somebody else's song with no
+        error at all.
+
+        The same silent-success trap as move_item, and worse: an item at or
+        before index_in_buffer is NOT deleted, MA logs a line and returns null.
+        An unknown id does error (code 3). So a removal is only proven by reading
+        the queue back and finding the id gone.
+        """
+        await self._call(
+            COMMANDS["queue_delete_item"],
+            {"queue_id": queue_id, "item_id_or_index": item_id},
         )
 
     async def play_announcement(self, url: str, volume_level: int | None = None) -> None:

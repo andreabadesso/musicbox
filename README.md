@@ -2,13 +2,59 @@
 
 A thin HTTP API in front of [Music Assistant](https://music-assistant.io/). It turns a
 Raspberry Pi 5 and a Bluetooth speaker into something another program can shout at:
-queue a track, play a track, drop an airhorn over whatever is playing, skip, pause,
-set the volume.
+search for a song by name, queue it, play it, drop an airhorn over whatever is playing,
+skip, pause, set the volume.
+
+## It is a jukebox
+
+The point of the box is that people at an event ask for songs out loud and the songs
+play. Nobody at a party is going to paste a Spotify URI, and an agent that has to ask
+for one ends every conversation with "send me a link".
+
+So the whole path from "toca Baile de Favela" to audio lives inside musicbox. `GET
+/search` finds a track by name across every provider Music Assistant has, and `POST
+/play` and `POST /queue` take that same free text directly: they search, take the first
+result that is actually playable, and say what they landed on.
+
+```sh
+curl -sS -X POST "http://pi5:8099/queue" -H 'Content-Type: application/json' \
+  -d '{"query": "Above and Beyond Sun in Your Eyes"}'
+```
+
+```json
+{
+  "ok": true,
+  "action": "queued",
+  "media": "spotify--asK7Swun://track/57HLbw5C35P2CjpNJ9ALuS",
+  "query": "Above and Beyond Sun in Your Eyes",
+  "resolved": {
+    "title": "Sun In Your Eyes (Original Mix)",
+    "artist": "Above & Beyond",
+    "uri": "spotify--asK7Swun://track/57HLbw5C35P2CjpNJ9ALuS"
+  }
+}
+```
+
+`resolved` is the part that matters. A search picks one track out of several and it can
+pick the wrong one, so the answer names the choice, which is what lets whoever asked say
+"no, the remix". `GET /queue` then shows the room what is coming up. The same three
+things exist as MCP tools with the same names and the same shapes, so an agent works
+exactly the same way.
+
+The second thing that matters is **where** a request lands. Load a 213 track playlist as
+background music and a plain append puts the next person's song at position 214, hours
+away, while the box cheerfully answers 200. Send `"position": "fair"` and it goes in
+front of the filler and behind the requests already waiting, so several people asking are
+played in the order they asked. Ask for a song that is already coming and nothing is
+added twice: the answer says where it is and how long the wait is. See
+[POST /queue](#post-queue).
 
 ## What this is
 
 - A small FastAPI service, `musicbox-server`, that speaks to Music Assistant over its
   websocket API and exposes a handful of event-shaped JSON endpoints.
+- Search, so a request in plain language becomes something playable without a human in
+  the middle pasting URIs.
 - The only thing your other system has to talk to. It never has to learn the Music
   Assistant protocol, the queue model, or the difference between a player id and a
   queue id.
@@ -159,6 +205,20 @@ against it.
    name echoed back in `player_name`. `ma_connected: false` means musicbox could not
    reach Music Assistant at all; `ma_authenticated: false` means it got there and the
    token was refused. Either way every other endpoint will fail until it is fixed.
+
+7. Ask it for a song by name, which is the thing the box is for.
+
+   ```sh
+   curl -sS --get http://127.0.0.1:8099/search --data-urlencode 'q=Baile de Favela'
+   curl -sS -X POST http://127.0.0.1:8099/queue \
+     -H 'Content-Type: application/json' \
+     -d '{"query": "Baile de Favela"}'
+   ```
+
+   An empty `results` list here usually means no provider that can search is connected.
+   The built-in URL provider cannot search anything; Spotify can. `GET
+   http://127.0.0.1:8095/api` with `{"command":"providers"}` lists what you have and
+   which of them advertise the `search` feature.
 
 ## Configuration
 
@@ -462,15 +522,143 @@ Tolerate nulls. `track` is null when nothing is loaded, and radio streams and pl
 URLs often have no duration, in which case `track.duration` is null and `position` is
 not meaningful.
 
+### GET /search
+
+Find something to play, by name, across every provider Music Assistant has connected.
+This is what makes the box a jukebox instead of a URI player.
+
+`q` is the text to search for. `type` is one of `track`, `album`, `artist` or
+`playlist` and defaults to `track`. `limit` defaults to 5 and is capped at 10.
+
+```sh
+curl -sS --get "$BOX/search" \
+  --data-urlencode 'q=Above and Beyond Sun in Your Eyes' \
+  --data-urlencode 'limit=3'
+```
+
+```json
+{
+  "ok": true,
+  "query": "Above and Beyond Sun in Your Eyes",
+  "type": "track",
+  "count": 3,
+  "results": [
+    {
+      "title": "Sun In Your Eyes (Original Mix)",
+      "artist": "Above & Beyond",
+      "album": "Group Therapy",
+      "uri": "spotify--asK7Swun://track/57HLbw5C35P2CjpNJ9ALuS",
+      "media_type": "track",
+      "playable": true,
+      "duration": 291
+    }
+  ]
+}
+```
+
+```sh
+curl -sS --get "$BOX/search" --data-urlencode 'q=Imogen Heap' --data-urlencode 'type=album'
+```
+
+Five things worth knowing before you build on this.
+
+- `playable: false` means Music Assistant knows the track and cannot play it here,
+  almost always a region or account restriction. Do not queue those. This is **not**
+  the item's own `is_playable` field, which is `true` on essentially every Spotify
+  result including the blocked ones; it comes from the provider mapping, which is where
+  Spotify's real answer ends up. A provider mapping that does not carry `available` at
+  all counts as available, because that is the field's declared default. Reading a
+  missing key as "no" would make the box refuse every song from that provider while
+  blaming region licensing.
+- `q` is capped at 250 characters. A song request is a handful of words, and a longer
+  one is a caller looping or a document pasted by accident. It answers 400 and does not
+  echo the text back.
+- The title carries the version in parentheses. "Sun In Your Eyes" and "Sun In Your
+  Eyes (Marsh Remix)" are different tracks and both exist.
+- An empty `results` list is a 200, not a 404. Nothing matched, or a provider is down,
+  and from out here those are indistinguishable.
+- `limit` costs real time. Music Assistant pages Spotify ten at a time, sequentially,
+  behind a rate limiter of one request every two seconds. Measured on the live box:
+  limit 5 takes about 1.3 s cold, limit 11 takes 4.2 s, all media types at limit 25
+  takes 5.4 s. Repeats are free for ten minutes, because Music Assistant caches the
+  result. Ask for 5.
+
+### GET /queue
+
+What is coming up, current item first. Takes `limit`, default 20, capped at 100.
+
+```sh
+curl -sS "$BOX/queue"
+```
+
+```json
+{
+  "ok": true,
+  "queue_id": "ma_musicbox",
+  "state": "playing",
+  "count": 213,
+  "index": 5,
+  "upcoming": 208,
+  "items": [
+    {
+      "position": 5,
+      "title": "Speeding Cars",
+      "artist": "Imogen Heap",
+      "album": "Goodnight And Go",
+      "duration": 212,
+      "uri": "spotify--asK7Swun://track/5lV8rweAOMVFFAjd7Oo42f",
+      "queue_item_id": "6dd077e39503409c90a874b897ec33d7",
+      "available": true
+    }
+  ]
+}
+```
+
+`count`, `upcoming` and `len(items)` are three different numbers and they differ
+constantly. `count` is the whole queue including what has already played, `upcoming` is
+what is left from the current item onward, and `items` is only the window you asked
+for. Telling someone their song is next based on the length of the list is how you tell
+someone their song is next when it is ninetieth.
+
+`position` is the item's real index in the queue, counted from 0, so the first item
+returned always has `position == index` and someone's wait is their position minus
+`index`. It is counted here rather than read off the item, because Music Assistant's own
+per item `sort_index` is not the position: the live box returned ordinals 0 to 7 carrying
+sort_index `0, 1, 2, 6, 4, 14, 18, 22` with shuffle off, since a sort_index is stamped
+when a track is added or moved and never renumbered afterwards. What MA does guarantee is
+that the window comes back in queue order starting at the offset you asked for.
+
+`uri` is null on an item that has none, which is what a raw stream queued by URL looks
+like. It is never backfilled with the `queue_item_id`: whatever is in `uri` can be handed
+straight back to `/play` or `/queue`, and a `queue_item_id` cannot, because it has no
+scheme and would be searched for as if it were the name of a song. Use `queue_item_id`,
+which is right there under its own name, for anything that addresses the queue slot.
+
+An empty queue answers 200 with `count: 0` and an empty list.
+
 ### POST /queue
 
-Append to the end of the queue. Takes either `uri` (a Music Assistant URI, for example
-a Spotify one) or `url` (a plain http or https audio URL).
+Put something in the queue. Takes any one of three fields for what to play:
+
+- `query`, free text, which is searched and resolved to the first playable track,
+- `uri`, a Music Assistant URI, for example a Spotify one,
+- `url`, a plain http or https audio URL.
+
+and two optional fields for how:
+
+- `position`, one of `end` (the default), `fair`, `next`, `now` or `replace`,
+- `force`, `true` to enqueue a track that is already waiting further down the queue.
 
 ```sh
 curl -sS -X POST "$BOX/queue" \
   -H 'Content-Type: application/json' \
-  -d '{"uri": "spotify://track/4cOdK2wGLETKBW3PvgPWqT"}'
+  -d '{"query": "Baile de Favela"}'
+```
+
+```sh
+curl -sS -X POST "$BOX/queue" \
+  -H 'Content-Type: application/json' \
+  -d '{"uri": "spotify--asK7Swun://track/57HLbw5C35P2CjpNJ9ALuS"}'
 ```
 
 ```sh
@@ -479,10 +667,213 @@ curl -sS -X POST "$BOX/queue" \
   -d '{"url": "https://example.com/audio/track.mp3"}'
 ```
 
+A request from somebody in the room, put in front of the background playlist rather than
+behind two hundred tracks of it:
+
+```sh
+curl -sS -X POST "$BOX/queue" \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "Baile de Favela", "position": "fair"}'
+```
+
+The answer always names what it acted on, and where it went:
+
+```json
+{
+  "ok": true,
+  "action": "queued",
+  "position": "fair",
+  "queue_position": 6,
+  "queue_position_exact": true,
+  "plays_after": 1,
+  "queue_item_id": "56168824cb2a4e9d99244e02b7b29f68",
+  "media": "spotify--asK7Swun://track/1EYPBmTdgIYIiAmFrCH0Ns",
+  "query": "Baile de Favela",
+  "resolved": {
+    "title": "Baile de Favela",
+    "artist": "MC João",
+    "uri": "spotify--asK7Swun://track/1EYPBmTdgIYIiAmFrCH0Ns"
+  },
+  "duplicate_check": { "position": null, "checked": 50, "upcoming": 208, "exhaustive": false }
+}
+```
+
+`resolved` and `query` are both null when you passed a URI or a URL, because nothing
+was guessed. When they are set, read them back to whoever asked for the song.
+
+`plays_after` is how many tracks play before this one, counted from the track that is
+audible right now. It is the number to tell a person. `queue_position` is the absolute
+index in the queue, and `queue_position_exact` says whether musicbox looked to confirm
+it or derived it from what the option is supposed to do. It is null when the landing
+slot could not be confirmed, and a null there means "it is queued, I cannot tell you
+where", never a guess.
+
+#### Where it lands: `position`
+
+The queue at an event usually has a long background playlist in it. Ours had 213 items
+with the fifth one playing, so every request appended went to position 214 and never
+played. The box answered 200 and did nothing anybody could hear, which is worse than an
+error.
+
+| `position` | What it does | Interrupts? |
+| --- | --- | --- |
+| `end` (default) | After everything already queued. Right for filling a quiet box, wrong for a request when a playlist is loaded. | no |
+| `fair` | After the other requests already waiting, in front of the background playlist. Several people asking are played in the order they asked. | no |
+| `next` | Right after the current track, jumping ahead of every request already waiting. | no |
+| `now` | Starts immediately, cutting the current track off. The rest of the queue is untouched. | yes |
+| `replace` | Throws the whole queue away and starts this instead. Same as `POST /play`. | yes |
+
+`end` stays the default so that every caller written before this existed keeps behaving
+exactly as it did.
+
+`fair` is the one to use for a person's request. Straight `next` is unfair in a way that
+is easy to miss: each new request jumps ahead of the previous one, so ten requests play
+in reverse order and whoever asked first waits longest.
+
+Music Assistant's remaining option, `replace_next`, is deliberately not reachable. It
+deletes everything after the current track, so on a 213 item queue its blast radius is
+the whole evening, and no phrase anybody says at a party maps to it.
+
+#### How `fair` is built, and what it cannot promise
+
+Music Assistant has no insert-at-index over its API. `PlayerQueues.load()` takes an
+`insert_at_index` and would be exactly right, but it carries no `@api_command`
+decorator and is not among the 238 commands the box publishes. What does exist is
+`player_queues/move_item`, which takes a **relative** shift, so an absolute target is
+reachable with `pos_shift = target - current_index_in_list`.
+
+So `fair` is: append with `add`, read the tail back to learn the `queue_item_id` that
+`play_media` does not return, then move it up into place, then read the queue again to
+confirm where it actually landed. Two writes and two reads, and the cost does not grow
+with the length of the queue. Nothing rewrites the 213 item list from the client side.
+
+Appending and then moving up is deliberate, not incidental. The append lands far past
+the buffered region, so the move cannot be refused for touching audio that is already
+generated, and if the playhead advances mid-operation the worst case is that the song is
+still at the end of the queue rather than suddenly being the next thing the room hears.
+
+Three honest limits:
+
+- **The lane is remembered in this process only.** Music Assistant gives no way to mark
+  an item as ours: `play_media` has no argument that sets `extra_attributes`, and every
+  item on the live queue has an empty dict there. Its own party provider marks guest
+  items and scans for them, but those handlers refuse anyone whose username is not
+  `party_guest`, and musicbox authenticates as `admin`. So musicbox remembers the
+  `queue_item_id`s it inserted, in memory. **Restart musicbox and `fair` degrades to
+  `next` until the lane is rebuilt.** Requests queued before the restart keep playing;
+  they just stop being counted when placing the next one.
+- **The duplicate window bounds the lane too.** Only the first 50 upcoming items are
+  read, so a request lane longer than that is not fully seen and a new request can land
+  ahead of an earlier one. The answer says so in `note` when that happens, and the test
+  for "that happened" is that a remembered item is sitting on the far edge of the
+  window, not that a remembered id went unfound. Ids stay remembered after their song
+  has played, and a played item is behind the playhead where the window never looks, so
+  the second test warned on every request of the evening after the first one.
+- **`move_item` refuses anything at or before `index_in_buffer`,** and near a track
+  boundary that can happen to a slot that was legal a second earlier. When it does, the
+  song stays at the end of the queue and `note` says why, rather than the request
+  failing.
+
+`next` has a caveat of its own worth knowing before you promise anything: the queue is
+permanently in flow mode (the snapcast provider hardcodes `requires_flow_mode`), and
+Music Assistant anchors an insert on `index_in_buffer`, which runs ahead of the audible
+track for roughly the last half minute of a song. So `next` normally means the very next
+song and occasionally means the one after that. `queue_position` counts from
+`index_in_buffer` for exactly that reason, the same anchor MA itself uses while the
+queue is playing or paused, so the count is right even while the generator is a track
+ahead of the speaker. `queue_position_exact` is still false, because the buffer can
+advance between the read and the insert.
+
+Verified on the live box, once: with 213 items and `current_index` 5, a `next` enqueue
+landed at index 6 and the count went 213 to 214, and `delete_item` took it back out with
+the count back at 213 and zero copies left anywhere in the queue. Note that
+`delete_item` returns null whether or not it deleted anything, so the only proof is
+reading the queue back, which is what musicbox does.
+
+#### Asking twice
+
+Somebody asking for a song that is already coming is the normal case at a party, not an
+error. Before enqueuing, musicbox checks whether the same track is already waiting
+**ahead of the current track**, and if it is, adds nothing:
+
+```json
+{
+  "ok": true,
+  "action": "already_queued",
+  "queue_position": 40,
+  "plays_after": 35,
+  "duplicate_check": { "position": 40, "checked": 50, "upcoming": 208, "exhaustive": false }
+}
+```
+
+`ok` is true and `action` is the field to read. There are three values: `queued`,
+`playing`, and `already_queued`. Tell the person it is coming in 35 songs. To queue it a
+second time on purpose, send `force: true`.
+
+Only what is still to play counts. A copy that has already played is not a duplicate,
+and this is not hypothetical: the live queue held the same track three times at
+positions 1, 2 and 4 with the fifth playing, and a whole queue check would have refused
+a perfectly reasonable request for it.
+
+The track at the current index is the one case in between, and it gets its own field.
+It is not waiting, it is on, so `already_playing` is true, nothing is queued, and
+`plays_after` is **null** rather than 0. Null on purpose: 0 reads as "it is next", and
+somebody who asks for the song that is playing must not be told it is coming when it is
+seconds from over and will not play again. Say "that is what is on right now", and send
+`force: true` if they want it again after this one. On a stopped or idle queue that same
+item has not played yet, so `already_playing` is false and 0 really does mean next.
+
+Matching is on the resolved URI and never on the title. The live queue holds several
+different remixes whose names all contain "Hide and Seek", and they are different
+tracks. A URI carries the provider **instance**, suffix and all
+(`spotify--asK7Swun://track/x`), so a URI typed by hand as `spotify://track/x` is
+compared with the instance suffix stripped; it resolves fine through Music Assistant and
+would otherwise never match anything in the queue. An item with no URI at all, which is
+what a raw stream URL looks like, can never be matched and is never a duplicate.
+
+The check reads a bounded window of 50 upcoming items, about three hours of music.
+Fetching the whole live queue is 637 KB, which is not a thing to do on every request. So
+`duplicate_check.exhaustive` is false whenever there is more queue past the window, and
+a copy sitting beyond it is genuinely missed. The answer says which, rather than
+claiming a clean no.
+
+`now` and `replace` skip the duplicate check entirely. "It is already at position 40" is
+not an answer to somebody who asked for a song right now, and an interrupt that silently
+does not interrupt is the failure this whole feature exists to remove.
+
+Which field you use is a hint, not a rule: the value is classified by what it looks
+like, not by which key it arrived in. Free text in `uri` is searched, and a Spotify
+share URL in `query` still resolves to exactly that track. Anything without a scheme is
+treated as text, so `{"query": "spotify"}` searches for the word rather than trying to
+open a bogus URI.
+
+The one thing that beats every other rule is an explicit `http://` or `https://` at the
+start: that is a URL and is handed to Music Assistant untouched even if it has a space in
+it, because `http://box:8099/sfx/file/my song.mp3` is a real file URL and searching for it
+would silently play an unrelated song. Text that merely mentions a link, like
+`toca https://... please`, does not start with the scheme and is still searched.
+
+If nothing playable is found the answer is a 404 naming the query, and the two ways of
+finding nothing are different sentences on purpose:
+
+```json
+{
+  "ok": false,
+  "error": "no_playable_match",
+  "detail": "Nothing matching 'asdfghjkl' was found on any connected music provider. Check the spelling, or try including the artist name, or pass a direct Spotify or http(s) link instead."
+}
+```
+
 ### POST /play
 
-Play now, replacing the queue. Same body as `/queue`. A playlist URI works here and is
-the usual way to start an event.
+Play now, replacing the queue. Same body as `/queue`, same resolution, same answer with
+`action: "playing"`. A playlist URI works here and is the usual way to start an event.
+
+```sh
+curl -sS -X POST "$BOX/play" \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "Sun in Your Eyes"}'
+```
 
 ```sh
 curl -sS -X POST "$BOX/play" \
@@ -495,6 +886,9 @@ curl -sS -X POST "$BOX/play" \
   -H 'Content-Type: application/json' \
   -d '{"url": "https://example.com/audio/intro.mp3"}'
 ```
+
+At an event `/queue` is almost always the one you want. `/play` clears the queue and
+cuts off whoever is currently playing.
 
 ### POST /drop
 
@@ -719,8 +1113,10 @@ Nothing else. No SSH, no wrapper process, no token. Use the Pi's tailnet name or
 
 | Tool | Arguments | What it does |
 | --- | --- | --- |
-| `play` | `uri_or_url` | Starts playing now, clearing the queue. Takes a provider URI or an http(s) URL. |
-| `queue` | `uri_or_url` | Appends to the queue without interrupting. |
+| `search` | `query`, `type`, `limit` | Finds tracks, albums, artists or playlists by name. Returns a compact list, each with a `uri`. |
+| `play` | `uri_or_url` | Starts playing now, clearing the queue. Takes plain text, a provider URI, or an http(s) URL. |
+| `queue` | `uri_or_url`, `position`, `force` | Puts a song in the queue without interrupting. This is the jukebox tool and the normal answer to a request. `position` is `end` (default), `fair`, `next`, `now` or `replace`; `force` queues a track that is already waiting. |
+| `get_queue` | `limit` | What is coming up, current track first, with the honest total. |
 | `drop` | `url`, `mode` | Plays a one shot sound from an http(s) URL. `mode` is `over` or `cut`. |
 | `sfx` | `name`, `mode` | The same, from a sound effect preloaded in `MUSICBOX_SFX_DIR`. |
 | `list_sfx` | none | The names `sfx` accepts. |
@@ -733,6 +1129,33 @@ Nothing else. No SSH, no wrapper process, no token. Use the Pi's tailnet name or
 
 `list_sfx` is also exposed as a resource, `musicbox://sfx`, so a client can see which
 sounds exist without spending a tool call on it.
+
+`play` and `queue` have one widened parameter rather than a second one beside it.
+`uri_or_url` accepts plain text, a provider URI and an http(s) URL, and the value is
+classified by what it looks like. A model choosing between `uri_or_url` and a separate
+`query` argument has to guess which of the two a string belongs in, and it will guess
+wrong on a share URL; one parameter that takes everything cannot be filled in wrong.
+The answer names the track and the words it was matched from:
+
+```
+Queued Sun In Your Eyes (Original Mix) by Above & Beyond, matched from 'above and
+beyond sun in your eyes'. It plays after the other requests and before the background
+playlist. It plays in 2 songs. If that is the wrong track, say so and search for
+another.
+```
+
+Searching first is optional. `queue` does the search itself, so the normal path for a
+request from the room is one tool call with the words the person said. Use `search`
+when you want to choose between versions or show someone the options.
+
+The tool descriptions teach the model the jukebox, because that is the only place it
+learns it: `queue` is the normal action and `play` is the exception that interrupts and
+clears everything; what each `position` value does to a room full of people waiting;
+that a song already coming answers `already in the queue at position N` with the wait in
+songs and adds nothing; and that `force` is how you queue it twice on purpose. A model
+that reads `already in the queue` as a failure retries with `force` and queues it twice,
+so that sentence is written to read as a success with a fact in it, and there is a test
+that keeps it that way.
 
 Every tool answers with a sentence or a small object, including when it fails. Music
 Assistant being down comes back as "Music Assistant is not reachable, so nothing

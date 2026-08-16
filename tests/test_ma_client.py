@@ -291,3 +291,79 @@ async def test_probe_info_works_without_a_token():
         async with connected_client(server, ma_token="") as client:
             info = await client.probe_info()
             assert info["server_version"] == "2.9.13"
+
+
+# ── search and queue reading ──────────────────────────────────────────────────
+
+
+@async_test()
+async def test_search_sends_one_media_type_as_a_list():
+    # A bare string instead of a list is a plain text 500 from the real server,
+    # with no error code to react to, so the shape of this argument matters more
+    # than it looks.
+    async with running_ma() as server:
+        async with connected_client(server) as client:
+            assert await client.wait_connected(5)
+            results = await client.search("sun in your eyes", "track", 3)
+            assert results["tracks"][0]["uri"] == (
+                "spotify--asK7Swun://track/57HLbw5C35P2CjpNJ9ALuS"
+            )
+            args = dict(server.calls)["music/search"]
+            assert args["media_types"] == ["track"]
+            assert args["search_query"] == "sun in your eyes"
+            assert args["limit"] == 3
+
+
+@async_test()
+async def test_search_refuses_a_media_type_before_it_reaches_the_server():
+    async with running_ma() as server:
+        async with connected_client(server) as client:
+            assert await client.wait_connected(5)
+            with pytest.raises(ValueError):
+                await client.search("x", "sandwich")
+            assert "music/search" not in dict(server.calls)
+
+
+@async_test()
+async def test_search_limit_is_clamped_to_what_spotify_pages_in_one_call():
+    async with running_ma() as server:
+        async with connected_client(server) as client:
+            assert await client.wait_connected(5)
+            await client.search("x", "track", 99)
+            assert dict(server.calls)["music/search"]["limit"] == 10
+            await client.search("x", "track", 0)
+            assert dict(server.calls)["music/search"]["limit"] == 1
+
+
+@async_test()
+async def test_search_with_no_match_returns_empty_lists_not_an_error():
+    async with running_ma() as server:
+        server.tracks = []
+        async with connected_client(server) as client:
+            assert await client.wait_connected(5)
+            results = await client.search("asdfghjkl", "track")
+            assert results["tracks"] == []
+            # radio is singular on the wire. Reading it as "radios" is a silent
+            # KeyError waiting to happen.
+            assert results["radio"] == []
+
+
+@async_test()
+async def test_queue_items_returns_the_requested_window():
+    async with running_ma() as server:
+        async with connected_client(server) as client:
+            assert await client.wait_connected(5)
+            items = await client.queue_items("snapcast_musicbox", limit=2, offset=2)
+            # Identified by queue_item_id, not by sort_index. sort_index is
+            # stamped when an item is added and never renumbered, so on the live
+            # box it is neither contiguous nor ordered and cannot tell you which
+            # slice you were handed.
+            assert [item["queue_item_id"] for item in items] == ["qi2", "qi3"]
+
+
+@async_test()
+async def test_queue_items_for_an_unknown_queue_is_empty_not_an_error():
+    async with running_ma() as server:
+        async with connected_client(server) as client:
+            assert await client.wait_connected(5)
+            assert await client.queue_items("nope") == []
