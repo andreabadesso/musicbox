@@ -115,7 +115,29 @@ class Prefetcher:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.max_bytes = max_bytes
-        self._session_factory = session_factory or (lambda: aiohttp.ClientSession())
+        # ThreadedResolver explicito, e nao o padrao do aiohttp.
+        #
+        # Quando o aiodns esta instalado (e esta, no closure deste projeto), o
+        # aiohttp escolhe AsyncResolver, que resolve via c-ares. O c-ares nao
+        # entende nameserver link-local com escopo de interface, e o DHCP desta
+        # rede entrega exatamente isso:
+        #
+        #   nameserver 192.168.0.1
+        #   nameserver fe80::1%wlan0
+        #
+        # O resultado e que todo download morria com
+        # "ClientConnectorDNSError ... Timeout while contacting DNS servers"
+        # enquanto `getent hosts` no MESMO host, e ate dentro do mesmo sandbox
+        # do systemd, resolvia na hora. Diagnosticado assim, comparando os dois.
+        #
+        # ThreadedResolver usa getaddrinfo do glibc, que trata o escopo
+        # corretamente. O custo e uma thread por resolucao, irrelevante para o
+        # punhado de downloads que este servico faz.
+        self._session_factory = session_factory or (
+            lambda: aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
+            )
+        )
         # One lock per URL, so two callers asking for the same track at once
         # download it once instead of racing to write the same file. At an event
         # this is the normal case, not the exotic one: two people request the
