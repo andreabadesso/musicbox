@@ -517,6 +517,19 @@ in
     bluetoothAudio = {
       enable = mkEnableOption "the bluez-alsa plus snapclient chain to a Bluetooth speaker";
 
+      latencyMs = mkOption {
+        type = types.int;
+        default = 200;
+        description = ''
+          Folga de buffer do snapclient, em milissegundos.
+
+          Nao mexa para baixo sem medir. Com 0 o audio engasga em caixa
+          Bluetooth: o A2DP tem jitter proprio e o ALSA acusa
+          "XRUN while waiting for PCM". Ver o comentario no ExecStart do
+          snapclient para os numeros.
+        '';
+      };
+
       speakerMac = mkOption {
         type = types.str;
         default = "";
@@ -948,11 +961,22 @@ in
             # so a default change cannot break the box mid-event.
             "--mixer"
             "software"
-            # Single client, so there is nothing to sync against. A2DP adds
-            # its own buffer either way; raise this only if you actually hear
-            # underruns.
+            # 200ms de folga, e nao zero.
+            #
+            # O valor era 0, justificado com "cliente unico, nada para
+            # sincronizar". Isso estava errado, e o erro so aparece com uma
+            # caixa Bluetooth real tocando: o A2DP tem jitter proprio, e sem
+            # folga o snapclient esvazia o buffer e o ALSA responde
+            #
+            #   [Error] (Alsa) XRUN while waiting for PCM: Broken pipe
+            #
+            # que sai como engasgo no som. Medido em 2026-08-17, numa janela de
+            # 2 minutos com musica tocando: 15 XRUNs com latency 0 (e o WiFi ja
+            # desligado, entao nao era interferencia), 0 com 200. Duzentos
+            # milissegundos sao imperceptiveis para musica ambiente e absorvem
+            # a variacao do link.
             "--latency"
-            "0"
+            (toString cfg.bluetoothAudio.latencyMs)
             # Default is the MAC address of whichever interface snapclient
             # picks, which means the player's name in MA changes if the network
             # hardware does, and MUSICBOX_PLAYER points at that name. Pin it.
