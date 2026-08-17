@@ -220,6 +220,7 @@ let
   # rather than quietly falling back to a tmpfiles rule that would fight the
   # dynamic uid.
   sfxStateDir = lib.removePrefix "/var/lib/" cfg.sfxDir;
+  cacheStateDir = lib.removePrefix "/var/lib/" cfg.cacheDir;
 
   # The address MA has to use to fetch our sfx files. See the trap note at the
   # top of this file for why this is pinned rather than inferred per request.
@@ -373,6 +374,35 @@ in
 
         Must live under /var/lib: it is created as a systemd StateDirectory,
         which is the only mechanism that gets ownership right under DynamicUser.
+      '';
+    };
+
+    cacheDir = mkOption {
+      type = types.str;
+      default = "/var/lib/musicbox/cache";
+      description = ''
+        Onde o audio baixado de URLs remotas fica guardado.
+
+        O musicbox baixa antes de tocar em vez de deixar o Music Assistant
+        fazer streaming ao vivo. Isso existe por medida, nao por gosto: na rede
+        do evento a banda oscilou entre 811 kB/s e 2,5 kB/s na mesma hora, e o
+        MA responde "Timeout waiting for audio data" quando a origem nao
+        acompanha a reproducao. Baixado uma vez, o arquivo toca perfeito pelo
+        resto do dia, mesmo se a internet cair.
+
+        Precisa ficar sob /var/lib pelo mesmo motivo do sfxDir: e um
+        StateDirectory de systemd, que e o unico mecanismo que acerta a posse
+        do diretorio sob DynamicUser.
+      '';
+    };
+
+    prefetch = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Baixar audio remoto antes de tocar. Desligue apenas se o link for
+        rapido e estavel e o espaco em disco for mais precioso que a
+        confiabilidade da reproducao.
       '';
     };
 
@@ -547,6 +577,8 @@ in
           MUSICBOX_MA_URL = cfg.maUrl;
           MUSICBOX_PLAYER = cfg.player;
           MUSICBOX_SFX_DIR = cfg.sfxDir;
+          MUSICBOX_CACHE_DIR = cfg.cacheDir;
+          MUSICBOX_PREFETCH = if cfg.prefetch then "1" else "0";
           MUSICBOX_SFX_BASE_URL = sfxBaseUrl;
           # Unbuffered, so a crash traceback is in the journal rather than lost
           # in a pipe buffer that never got flushed.
@@ -568,7 +600,12 @@ in
           # box needs a persistent `musicbox` account: the service owns exactly
           # one directory and systemd carries that across the uid change.
           DynamicUser = true;
-          StateDirectory = sfxStateDir;
+          # Os dois diretorios, e nao so o de sfx. O cache de download tambem e
+          # escrito pelo servico sob DynamicUser, e sem declarar aqui ele
+          # nasceria fora do alcance do uid transitorio: o download falharia com
+          # permissao negada e a caixa voltaria a tocar em streaming sem que
+          # ninguem entendesse por que.
+          StateDirectory = [ sfxStateDir cacheStateDir ];
           # 0755 so a human can read what they dropped in. The dir sits inside
           # /var/lib/private, which is 0700 root, so this is not an exposure:
           # it just means root can `cp` files in without a chown dance.

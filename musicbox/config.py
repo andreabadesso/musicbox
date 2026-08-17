@@ -16,6 +16,7 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8099
 DEFAULT_MA_URL = "http://127.0.0.1:8095"
 DEFAULT_SFX_DIR = "/var/lib/musicbox/sfx"
+DEFAULT_CACHE_DIR = "/var/lib/musicbox/cache"
 
 
 def _read_secret(env: Mapping[str, str], inline: str, from_file: str) -> str:
@@ -50,6 +51,21 @@ def _int(env: Mapping[str, str], name: str, default: int) -> int:
         return default
 
 
+def _bool(env, key: str, default: bool) -> bool:
+    """Read a flag the way a person would write it.
+
+    "0", "false", "no" and "off" are all off, case insensitive. Anything else
+    that is set counts as on. A typo therefore errs towards the feature being
+    enabled, which is the right direction here: prefetch protects playback, so
+    accidentally leaving it on costs disk, while accidentally turning it off
+    costs silence in a room.
+    """
+    raw = env.get(key)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 def _float(env: Mapping[str, str], name: str, default: float) -> float:
     raw = env.get(name, "").strip()
     if not raw:
@@ -68,6 +84,16 @@ class Config:
     player: str = ""
     sfx_dir: Path = field(default_factory=lambda: Path(DEFAULT_SFX_DIR))
     token: str = ""
+
+    # ── Baixar antes de tocar ─────────────────────────────────────────────────
+    # Where downloaded audio lands, and whether to download at all. On by
+    # default because streaming a remote URL over a bad link is how the box
+    # fails in front of people: MA answers "Timeout waiting for audio data" and
+    # nothing plays. See musicbox/prefetch.py for the measurements.
+    cache_dir: Path = field(default_factory=lambda: Path(DEFAULT_CACHE_DIR))
+    prefetch: bool = True
+    prefetch_timeout: float = 300.0
+    prefetch_max_bytes: int = 100 * 1024 * 1024
 
     # Music Assistant 2.9 authenticates every command except the four auth ones,
     # so a token is not optional in practice. It is provisioned once (POST
@@ -99,6 +125,10 @@ class Config:
             ma_url=(env.get("MUSICBOX_MA_URL", DEFAULT_MA_URL).strip() or DEFAULT_MA_URL).rstrip("/"),
             player=env.get("MUSICBOX_PLAYER", "").strip(),
             sfx_dir=Path(env.get("MUSICBOX_SFX_DIR", DEFAULT_SFX_DIR).strip() or DEFAULT_SFX_DIR),
+            cache_dir=Path(env.get("MUSICBOX_CACHE_DIR", DEFAULT_CACHE_DIR).strip() or DEFAULT_CACHE_DIR),
+            prefetch=_bool(env, "MUSICBOX_PREFETCH", True),
+            prefetch_timeout=_float(env, "MUSICBOX_PREFETCH_TIMEOUT", 300.0),
+            prefetch_max_bytes=_int(env, "MUSICBOX_PREFETCH_MAX_BYTES", 100 * 1024 * 1024),
             token=_read_secret(env, "MUSICBOX_TOKEN", "MUSICBOX_TOKEN_FILE"),
             ma_token=_read_secret(env, "MUSICBOX_MA_TOKEN", "MUSICBOX_MA_TOKEN_FILE"),
             sfx_base_url=env.get("MUSICBOX_SFX_BASE_URL", "").strip().rstrip("/"),

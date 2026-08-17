@@ -53,6 +53,11 @@ def config_for(server: FakeMA, **overrides) -> Config:
         announce_timeout=5.0,
         backoff_initial=0.05,
         backoff_max=0.2,
+        # Desligado por padrao nos testes que NAO sao sobre prefetch. Ligado, a
+        # suite tentaria baixar de verdade as URLs de exemplo (https://x/y.mp3)
+        # e ficaria refem da rede da maquina que roda o teste. Os testes de
+        # prefetch ligam explicitamente e apontam para um servidor local.
+        prefetch=False,
     )
     values.update(overrides)
     return Config(**values)

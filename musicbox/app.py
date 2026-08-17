@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 
 from . import logs
 from .config import Config
+from .prefetch import PrefetchError, Prefetcher
 from .ma_client import (
     BUFFERED_DETAIL,
     ERR_INSUFFICIENT_PERMISSIONS,
@@ -1126,6 +1127,65 @@ async def _verify_position(
     return None
 
 
+# O prefetcher e um global de modulo, e isso e deliberado.
+#
+# perform_media e chamado de quatro lugares (duas rotas HTTP e dois backends
+# MCP) e nenhum deles tem o Config em maos. Passar o objeto por todos exigiria
+# mudar as quatro assinaturas e a fronteira do MCP na vespera do evento, para
+# ganhar pureza que ninguem vai usar: existe exatamente um prefetcher por
+# processo, criado no create_app e nunca trocado. Quando isso for refatorado,
+# o lugar certo e um objeto de servico carregando ma + config + prefetcher.
+_PREFETCHER: Prefetcher | None = None
+
+
+def set_prefetcher(prefetcher: Prefetcher | None) -> None:
+    global _PREFETCHER
+    _PREFETCHER = prefetcher
+
+
+def get_prefetcher() -> Prefetcher | None:
+    return _PREFETCHER
+
+
+async def localize_media(media: str) -> dict[str, Any]:
+    """Troca uma URL remota pela copia local, baixando se preciso.
+
+    Devolve sempre um dicionario com `media` (o que deve ir para o MA) e o que
+    aconteceu, porque a resposta ao chamador precisa dizer que houve download:
+    numa rede ruim isso explica por que o comando demorou trinta segundos, e
+    sem essa explicacao a demora parece travamento.
+
+    Falha de download NAO derruba a chamada. Se nao deu para baixar, tocamos a
+    URL original e deixamos o MA tentar em streaming, que e o comportamento
+    antigo. Pior caso voltamos ao que era antes, nunca a menos que isso.
+    """
+    prefetcher = _PREFETCHER
+    if prefetcher is None or not prefetcher.handles(media):
+        return {"media": media, "prefetched": False, "reason": None}
+    try:
+        result = await prefetcher.ensure_local(media)
+    except PrefetchError as exc:
+        logs.warn("prefetch_failed", url=media, error=str(exc))
+        return {"media": media, "prefetched": False, "reason": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        # Qualquer coisa, e nao so PrefetchError. Um cache_dir que nao da para
+        # criar levantava PermissionError daqui ate virar 500, e uma otimizacao
+        # de rede derrubando o pedido inteiro e o pior negocio possivel: sem
+        # isso, um diretorio mal configurado tira o box do ar em vez de apenas
+        # voltar a tocar em streaming. Encontrado pelos testes, e teria
+        # aparecido no evento como "nao toca mais nada".
+        logs.warn("prefetch_broken", url=media, error=f"{type(exc).__name__}: {exc}")
+        return {"media": media, "prefetched": False, "reason": f"{type(exc).__name__}: {exc}"}
+    return {
+        "media": prefetcher.local_url(result.filename),
+        "prefetched": True,
+        "cached": result.cached,
+        "bytes": result.bytes,
+        "source": result.source,
+        "reason": None,
+    }
+
+
 async def perform_media(
     ma: MAClient,
     wanted: str,
@@ -1148,12 +1208,14 @@ async def perform_media(
     position = normalize_position(position)
     option = QUEUE_POSITIONS[position]
     resolution = await resolve_media(ma, wanted)
-    media = resolution["media"]
+    local = await localize_media(resolution["media"])
+    media = local["media"]
 
     answer: dict[str, Any] = {
         "ok": True,
         "position": position,
         "media": media,
+        "prefetched": local["prefetched"],
         "query": resolution["query"],
         "resolved": resolution["resolved"],
     }
@@ -1532,6 +1594,21 @@ def create_app(config: Config | None = None, ma: MAClient | None = None) -> Fast
     # See mcp_server.MountedMCP for why that entering is not optional.
     mcp_mount = MountedMCP(config, ma, lane)
 
+    # A URL base do prefetcher e a MESMA dos sfx, e nao por economia: e o
+    # endereco que o Music Assistant consegue alcancar de dentro do container,
+    # que ja foi resolvido e testado uma vez. Reaproveitar significa que se um
+    # dia esse calculo mudar, muda para os dois juntos e nao so para metade.
+    set_prefetcher(
+        Prefetcher(
+            config.cache_dir,
+            sfx_base_url_from_config(config),
+            timeout=config.prefetch_timeout,
+            max_bytes=config.prefetch_max_bytes,
+        )
+        if config.prefetch
+        else None
+    )
+
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
         logs.log(
@@ -1708,6 +1785,22 @@ def create_app(config: Config | None = None, ma: MAClient | None = None) -> Fast
     @open_router.head("/sfx/file/{name}", include_in_schema=False)
     async def sfx_file_head(name: str):
         return await sfx_file(name)
+
+    # O mesmo par GET/HEAD para o audio baixado. Sem autenticacao pela mesma
+    # razao que os sfx: quem busca aqui e o Music Assistant, de dentro do
+    # container, e ele nao carrega o nosso bearer. FileResponse de novo porque
+    # o MA precisa de Content-Length real para descobrir a duracao.
+    @open_router.get("/cache/file/{name}")
+    async def cache_file(name: str):
+        prefetcher = get_prefetcher()
+        path = prefetcher.cached_path(name) if prefetcher else None
+        if path is None:
+            raise HTTPException(status_code=404, detail=f"nothing cached under {name!r}")
+        return FileResponse(path)
+
+    @open_router.head("/cache/file/{name}", include_in_schema=False)
+    async def cache_file_head(name: str):
+        return await cache_file(name)
 
     @api.get("/now")
     async def now() -> dict[str, Any]:
