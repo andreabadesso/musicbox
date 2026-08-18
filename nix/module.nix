@@ -519,14 +519,14 @@ in
 
       latencyMs = mkOption {
         type = types.int;
-        default = 200;
+        default = 500;
         description = ''
           Folga de buffer do snapclient, em milissegundos.
 
           Nao mexa para baixo sem medir. Com 0 o audio engasga em caixa
           Bluetooth: o A2DP tem jitter proprio e o ALSA acusa
-          "XRUN while waiting for PCM". Ver o comentario no ExecStart do
-          snapclient para os numeros.
+          "XRUN while waiting for PCM". Numa sala cheia ate 200 foi pouco.
+          Ver o comentario no ExecStart do snapclient para os numeros.
         '';
       };
 
@@ -961,7 +961,7 @@ in
             # so a default change cannot break the box mid-event.
             "--mixer"
             "software"
-            # 200ms de folga, e nao zero.
+            # 500ms de folga, e nao zero.
             #
             # O valor era 0, justificado com "cliente unico, nada para
             # sincronizar". Isso estava errado, e o erro so aparece com uma
@@ -975,6 +975,14 @@ in
             # desligado, entao nao era interferencia), 0 com 200. Duzentos
             # milissegundos sao imperceptiveis para musica ambiente e absorvem
             # a variacao do link.
+            #
+            # Subiu de 200 para 500 no dia seguinte, com a sala cheia: as mesmas
+            # duas medidas deram 338 XRUNs em 10 minutos com 200, e 0 em 2
+            # minutos com 500. O link Bluetooth piora com gente no meio e com
+            # mais radio na sala, entao o valor que bastava numa sala vazia nao
+            # basta num evento. Meio segundo continua imperceptivel para musica
+            # ambiente, e o custo aparece so em comando: pause e skip demoram
+            # esse tanto para virar silencio.
             "--latency"
             (toString cfg.bluetoothAudio.latencyMs)
             # Default is the MAC address of whichever interface snapclient
