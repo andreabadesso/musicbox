@@ -519,15 +519,32 @@ in
 
       alsaBufferMs = mkOption {
         type = types.int;
-        default = 500;
+        default = 200;
         description = ''
           Tamanho do buffer do dispositivo ALSA, em milissegundos, passado ao
           snapclient como `--player alsa:buffer_time=`.
 
           Este e o buffer que de fato sofre underrun, e o default do snapclient
-          e 80ms. Num link A2DP com a sala cheia isso e pouco: medido em
-          2026-08-18, 484 XRUNs em 5 minutos com 80ms, e 0 em 2 minutos com
-          500ms, sem mudar mais nada.
+          e 80ms. Num link A2DP com a sala cheia isso e pouco: 484 XRUNs em 5
+          minutos.
+
+          Mas existe teto, e ele morde de um jeito pior que o underrun. Com
+          500ms o snapclient tenta encher o buffer inteiro de uma vez e pede
+          ~118ms de audio, enquanto o snapserver do Music Assistant entrega em
+          pedacos de 26ms. Ele nunca monta um periodo, e o resultado e
+
+            Exception: Not enough frames available, requested frames: 5677,
+            available: 1152
+            Failed to get chunk
+
+          repetido para sempre, com o Music Assistant reportando "playing" e a
+          caixa em silencio. Silencio com tudo verde e pior que engasgo.
+          Aumentar o numero de fragmentos NAO resolve: o tamanho do pedido vem
+          do espaco vazio no buffer, nao do periodo.
+
+          200ms e onde os dois convivem: grande o bastante para o jitter do
+          A2DP, pequeno o bastante para o stream conseguir preencher. Medido em
+          2026-08-18: 0 XRUNs e 0 falhas de chunk numa janela de 5 minutos.
 
           Nao confunda com `latencyMs`: aquele desloca o instante da
           reproducao para sincronizar clientes, este dimensiona o buffer. Foram
@@ -980,10 +997,10 @@ in
             # Explicito mesmo sendo o default, para que uma mudanca futura de
             # default falhe alto em vez de escolher pipewire em silencio.
             #
-            # O buffer_time aqui e o que resolve engasgo em caixa Bluetooth. O
-            # default do snapclient e 80ms, curto demais para o jitter do A2DP
-            # numa sala cheia: 484 XRUNs em 5 minutos com 80, 0 em 2 minutos
-            # com 500. Ver alsaBufferMs para o resto da historia.
+            # O buffer_time aqui e o que resolve engasgo em caixa Bluetooth,
+            # e tem teto dos dois lados: 80ms (o default) engasga, 500ms para
+            # de tocar. Ver alsaBufferMs, que conta a historia inteira com os
+            # numeros.
             "--player"
             "alsa:buffer_time=${toString cfg.bluetoothAudio.alsaBufferMs},fragments=${toString cfg.bluetoothAudio.alsaFragments}"
             # Raw ALSA PCM name, handed straight to snd_pcm_open.
