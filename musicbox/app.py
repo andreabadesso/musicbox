@@ -21,10 +21,11 @@ from typing import Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from . import logs
+from .board import BOARD_HTML
 from .config import Config
 from .prefetch import PrefetchError, Prefetcher
 from .ma_client import (
@@ -1790,6 +1791,18 @@ def create_app(config: Config | None = None, ma: MAClient | None = None) -> Fast
     # razao que os sfx: quem busca aqui e o Music Assistant, de dentro do
     # container, e ele nao carrega o nosso bearer. FileResponse de novo porque
     # o MA precisa de Content-Length real para descobrir a duracao.
+    # ── Soundboard ────────────────────────────────────────────────────────────
+    # Sem autenticacao, como o resto das rotas abertas. E a mesma decisao ja
+    # tomada para /mcp: a porta e tailnet-only, e exigir um bearer numa pagina
+    # que a pessoa abre no celular no meio de um evento transforma um botao em
+    # um problema de suporte.
+    #
+    # Sem cache: a lista de sons muda quando alguem copia um arquivo novo, e
+    # uma pagina cacheada mostraria um teclado desatualizado.
+    @open_router.get("/board", response_class=HTMLResponse)
+    async def board():
+        return HTMLResponse(BOARD_HTML, headers={"cache-control": "no-store"})
+
     @open_router.get("/cache/file/{name}")
     async def cache_file(name: str):
         prefetcher = get_prefetcher()

@@ -1550,3 +1550,30 @@ def test_fair_without_an_active_queue_still_adds(tmp_path):
     assert body["action"] == "queued"
     assert body["queue_position"] is None
     assert ("play_media", TRACK_URI, "add") in stub.calls
+
+
+def test_the_soundboard_page_serves_without_a_token(tmp_path):
+    """A pagina abre mesmo com token configurado para o resto da API.
+
+    Ela e aberta no celular no meio de um evento; exigir bearer ali
+    transformaria um botao em problema de suporte. Mesma decisao ja tomada
+    para /mcp.
+    """
+    from fastapi.testclient import TestClient
+
+    from musicbox.app import create_app
+    from musicbox.config import Config
+
+    sfx = tmp_path / "sfx"
+    sfx.mkdir()
+    config = Config(player="musicbox", sfx_dir=sfx, token="segredo", prefetch=False)
+    with TestClient(create_app(config)) as client:
+        # Sem Authorization nenhum.
+        page = client.get("/board")
+        assert page.status_code == 200
+        assert "text/html" in page.headers["content-type"]
+        # O que a pagina precisa ter para funcionar: os atalhos e as chamadas.
+        assert "keydown" in page.text
+        assert "/sfx/" in page.text
+        # E o resto da API continua fechado.
+        assert client.get("/now").status_code == 401
