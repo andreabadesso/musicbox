@@ -517,6 +517,35 @@ in
     bluetoothAudio = {
       enable = mkEnableOption "the bluez-alsa plus snapclient chain to a Bluetooth speaker";
 
+      alsaBufferMs = mkOption {
+        type = types.int;
+        default = 500;
+        description = ''
+          Tamanho do buffer do dispositivo ALSA, em milissegundos, passado ao
+          snapclient como `--player alsa:buffer_time=`.
+
+          Este e o buffer que de fato sofre underrun, e o default do snapclient
+          e 80ms. Num link A2DP com a sala cheia isso e pouco: medido em
+          2026-08-18, 484 XRUNs em 5 minutos com 80ms, e 0 em 2 minutos com
+          500ms, sem mudar mais nada.
+
+          Nao confunda com `latencyMs`: aquele desloca o instante da
+          reproducao para sincronizar clientes, este dimensiona o buffer. Foram
+          horas ate essa distincao ficar clara, porque subir o latencyMs
+          "ajudava" o suficiente para parecer a solucao.
+        '';
+      };
+
+      alsaFragments = mkOption {
+        type = types.int;
+        default = 8;
+        description = ''
+          Numero de fragmentos do buffer ALSA. O default do snapclient e 4.
+          Mais fragmentos significam despertares mais frequentes e menores, o
+          que ajuda quando a fonte entrega em rajadas, que e o caso do A2DP.
+        '';
+      };
+
       latencyMs = mkOption {
         type = types.int;
         default = 500;
@@ -948,10 +977,15 @@ in
             # discovery (tcp://_snapcast._tcp) for a server on loopback, which
             # would make this depend on avahi for no reason.
             "tcp://127.0.0.1:1704"
-            # Explicit even though it is the default, so that a future default
-            # change fails loudly instead of quietly selecting pipewire.
+            # Explicito mesmo sendo o default, para que uma mudanca futura de
+            # default falhe alto em vez de escolher pipewire em silencio.
+            #
+            # O buffer_time aqui e o que resolve engasgo em caixa Bluetooth. O
+            # default do snapclient e 80ms, curto demais para o jitter do A2DP
+            # numa sala cheia: 484 XRUNs em 5 minutos com 80, 0 em 2 minutos
+            # com 500. Ver alsaBufferMs para o resto da historia.
             "--player"
-            "alsa"
+            "alsa:buffer_time=${toString cfg.bluetoothAudio.alsaBufferMs},fragments=${toString cfg.bluetoothAudio.alsaFragments}"
             # Raw ALSA PCM name, handed straight to snd_pcm_open.
             "--soundcard"
             bluealsaPcm
