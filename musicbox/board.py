@@ -89,12 +89,33 @@ async function loadSfx() {
   try {
     const r = await fetch('/sfx');
     const d = await r.json();
-    names = (d.sfx || []).map(x => typeof x === 'string' ? x : x.name).filter(Boolean);
+    names = ordered((d.sfx || []).map(x => typeof x === 'string' ? x : x.name).filter(Boolean));
     render();
     if (!names.length) say('nenhum sfx instalado ainda');
   } catch (e) {
     say('nao consegui listar os sons: ' + e, true);
   }
+}
+
+// A ordem das teclas e explicita, e nao alfabetica.
+//
+// Antes eram simplesmente os dez primeiros em ordem alfabetica, e isso
+// remapeava o teclado toda vez que alguem adicionava um som: instalar
+// "clima" empurrou "queisso" para fora da tecla 0 sem ninguem pedir. Num
+// evento a memoria muscular vale mais que a ordem, entao a lista manda.
+//
+// Nome que estiver aqui e nao existir no disco e ignorado, e o que sobrar
+// entra depois, sem tecla. Assim da para editar esta lista sem medo.
+const KEY_ORDER = [
+  "airhorn", "fogo", "clima", "rapaz", "uepa",
+  "laele", "zedamanga", "deuruim", "aplausos", "terminou"
+];
+
+function ordered(all) {
+  const set = new Set(all);
+  const first = KEY_ORDER.filter(n => set.has(n));
+  const rest = all.filter(n => !first.includes(n)).sort();
+  return first.concat(rest);
 }
 
 // As dez primeiras ganham tecla: 1 a 9 e depois 0, que e a ordem que a mao
