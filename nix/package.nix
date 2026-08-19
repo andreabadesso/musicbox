@@ -15,11 +15,27 @@
 # Pi happens to have. That also means the `websockets` library is unused:
 # aiohttp's ClientSession carries the socket, which is the same transport
 # fastapi and uvicorn are already dragging in, so it costs nothing extra.
+#
+# `withMixer` is off by default and that default is load bearing, not tidiness.
+# See the comment on the argument itself.
 { lib
 , python3Packages
+  # Build the variant that can run `musicbox-mixer`, which needs numpy and
+  # pyalsaaudio. Default FALSE so the plain musicbox package, the one the box is
+  # running right now, keeps exactly the closure it has today: adding numpy
+  # unconditionally would change this derivation's hash, and therefore the
+  # system toplevel, for every deployment including the ones with no mixer.
+  # numpy alone drags in openblas, blas, lapack and gfortran-lib, about 180 MB
+  # unpacked. All cached for aarch64-linux (checked, 13 paths, 27.8 MiB of
+  # download, zero source builds) but still not something to hand a box that
+  # does not use it.
+  #
+  # nix/module.nix flips this via `cfg.package.override` when
+  # services.musicbox.mixer.enable is on, so a consumer never sets it by hand.
+, withMixer ? false
 }:
 
-python3Packages.buildPythonApplication {
+python3Packages.buildPythonApplication ({
   pname = "musicbox";
   version = "0.1.0";
 
@@ -83,7 +99,28 @@ python3Packages.buildPythonApplication {
     # list: it is pure Python on top of pydantic, httpx, starlette and anyio,
     # all of which fastapi already drags in.
     mcp
-  ];
+  ]
+  # ── The mixer's two extra dependencies ────────────────────────────────────
+  # Kept out of the default build on purpose (see `withMixer` above), and kept
+  # in a list that is only forced when it is on, which is what makes this safe
+  # on darwin: pyalsaaudio builds against alsa-lib and does not exist as a
+  # working package there, so evaluating it unconditionally would break
+  # `nix build` and `nix flake check` on the development Mac. Nix lists are
+  # lazy, so with withMixer = false these two names are never looked up.
+  #
+  # Both are in the binary cache for aarch64-linux, which is the only
+  # acceptable state for this box: it boots off an SD card and has wedged
+  # itself twice compiling from source. pyalsaaudio 0.11.0, numpy 2.3.4.
+  ++ lib.optionals withMixer (with python3Packages; [
+    # The ALSA binding. snd_pcm_writei is called with the GIL released, so the
+    # audio thread's blocking write does not stall the rest of the process,
+    # which is the property the whole mixer design rests on.
+    pyalsaaudio
+    # The mix itself. float32 accumulate, clip, one cast to int16 at the end.
+    # Measured on this Pi at 27.5 us per 20 ms period with four voices, which
+    # is 0.14% of one core of four; there is no argument for hand-rolling it.
+    numpy
+  ]);
 
   # nixpkgs' runtime-deps hook fails the build when a pyproject pin falls
   # outside what nixpkgs ships, and nixpkgs moves faster than any pin we would
@@ -114,3 +151,26 @@ python3Packages.buildPythonApplication {
     mainProgram = "musicbox-server";
   };
 }
+# `//` and not a plain attribute, because an attribute that is present with an
+# empty value is NOT the same derivation as an attribute that is absent:
+# `postInstall = ""` still lands in the .drv and changes its hash. The whole
+# point of withMixer is that the default build stays byte for byte what the box
+# is running, so the attribute has to disappear entirely when it is off.
+#
+# The mixer module itself is deliberately NOT in pythonImportsCheck: it imports
+# numpy at module scope (alsaaudio is imported inside AlsaSink.open on purpose,
+# so that everything except the ALSA output works with no sound card anywhere),
+# and that check runs on the BUILD machine, which is
+# one more way for a build to fail for reasons that have nothing to do with the
+# Pi. What is worth asserting is the thing nix/module.nix actually execs. This
+# catches the [project.scripts] entry going missing, which would otherwise show
+# up as a mixer unit that cannot start on a live box.
+// lib.optionalAttrs withMixer {
+  postInstall = ''
+    if [ ! -x "$out/bin/musicbox-mixer" ]; then
+      echo "withMixer = true but $out/bin/musicbox-mixer was not installed." >&2
+      echo "Add musicbox-mixer to [project.scripts] in pyproject.toml." >&2
+      exit 1
+    fi
+  '';
+})

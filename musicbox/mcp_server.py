@@ -42,6 +42,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from . import __version__
 from .app import (
+    MIXER_NOTE,
     OVER_NOTE,
     QUEUE_PAGE_DEFAULT,
     QUEUE_POSITION_DEFAULT,
@@ -50,11 +51,13 @@ from .app import (
     NoPlayableMatch,
     RequestLane,
     do_reconnect,
+    get_mixer,
     list_sfx,
     looks_like_uri,
     now_snapshot,
     perform_drop,
     perform_media,
+    perform_sfx,
     queue_snapshot,
     resolve_sfx,
     search_media,
@@ -97,10 +100,13 @@ songs away it is. Pass force true to queue it a second time on purpose.
 
 get_queue shows what is coming up, current track first.
 
-drop and sfx fire a one shot sound. mode "over" hands it to Music Assistant's
-announcement path; mode "cut" pauses the music, plays the sound, and resumes
-where it stopped. Music Assistant has no ducking, so "over" silences the music
-for the length of the sound rather than lowering it.
+drop and sfx fire a one shot sound. mode "over" plays it on top of what is
+playing; mode "cut" pauses the music, plays the sound, and resumes where it
+stopped. What "over" actually sounds like depends on how the box is set up, and
+the answer says which one happened: with the mixer running the music ducks
+under the effect and repeated presses layer, and without it Music Assistant
+silences the music for the length of the sound and plays repeats one after
+another. Read the answer rather than promising either behaviour up front.
 
 Every tool answers with a sentence, including when it fails. Nothing here
 raises, so read the answer rather than assuming a call succeeded.\
@@ -271,7 +277,12 @@ class LocalBackend:
         # NixOS module always sets) is what makes this reachable from inside
         # the Music Assistant container.
         url = sfx_file_url(sfx_base_url_from_config(self._config), path.name)
-        result = await perform_drop(self._ma, url, mode)
+        # perform_sfx, not perform_drop: it takes the musicbox-mixer path when
+        # the mixer is enabled and MA's announcement path when it is not, so
+        # this tool and POST /sfx cannot end up disagreeing about which one a
+        # given box uses. get_mixer() is None unless create_app set one, which
+        # is the same opt-in the HTTP route reads.
+        result = await perform_sfx(self._ma, path, url, mode, get_mixer())
         result["sfx"] = path.stem
         return result
 
@@ -452,7 +463,22 @@ class HttpBackend:
 def _describe_drop(result: dict[str, Any], what: str) -> str:
     used = result.get("mode_used", "over")
     if used == "over":
-        return f"Played {what} over the music. {OVER_NOTE}"
+        # Which path was taken is not a detail: the two SOUND different, and a
+        # model that tells someone "the music will duck" when it is about to
+        # stop dead has misled them. `path` is absent on older answers and on
+        # the /drop route, which is why the default is the announcement one.
+        if result.get("path") == "mixer":
+            line = f"Played {what} on top of the music. {MIXER_NOTE}"
+            if result.get("voices"):
+                line += f" {result['voices']} effect voices are playing right now."
+            return line
+        line = f"Played {what} over the music. {OVER_NOTE}"
+        if result.get("fell_back") and result.get("reason"):
+            # The mixer was supposed to handle this one and could not. Say so,
+            # because the person listening just heard the music stop and will
+            # ask why.
+            line += f" {result['reason']}."
+        return line
     line = f"Cut to {what} and "
     line += "resumed the music where it stopped." if result.get("resumed") else "the music was not playing."
     if result.get("fell_back"):
@@ -854,7 +880,11 @@ def register_tools(mcp: FastMCP, backend: Any) -> None:
         mode "over" hands it to Music Assistant's announcement path. mode "cut"
         pauses the music, plays the sound, then resumes where it stopped.
         Music Assistant has no ducking: "over" silences the music for the
-        length of the sound rather than lowering it under the sound.
+        length of the sound rather than lowering it under the sound. That is
+        true for drop even on a box running musicbox-mixer, because the mixer
+        plays files that are already on the machine and this tool takes a URL.
+        For a real ducked overlay, put the file in the sfx directory and use
+        sfx.
 
         This is for short sounds, not for music. To play a track or a whole
         file, use play. For a sound already loaded on the box, use sfx.
@@ -871,8 +901,16 @@ def register_tools(mcp: FastMCP, backend: Any) -> None:
         """Play one of the sound effects preloaded on the box.
 
         Call list_sfx for the names. mode works exactly as it does for drop:
-        "over" plays it through the announcement path, "cut" pauses the music,
-        plays it, and resumes where it stopped.
+        "over" plays it on top of the music, "cut" pauses the music, plays it,
+        and resumes where it stopped.
+
+        On a box running musicbox-mixer, "over" really is on top: the music
+        ducks under the effect and comes back, and firing the same effect again
+        while it is still playing adds another copy instead of queueing, so
+        rapid presses stutter rather than waiting in line. Without the mixer,
+        "over" goes through Music Assistant's announcement path, which silences
+        the music for the length of the effect and plays repeats strictly one
+        after another. The answer says which one happened.
 
         This only plays names that are already on the box. For a sound at an
         http(s) URL, use drop.

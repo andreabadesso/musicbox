@@ -27,13 +27,36 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest", "httpx"]
+# numpy is in the TEST set as well as in mixer, and not marked optional in the
+# suite, on purpose: tests/test_mixer.py must FAIL rather than skip when it is
+# missing. A mixing test that quietly skips is a mixing test that is not run,
+# and the arithmetic it covers is the difference between a sound effect and a
+# burst of clipping noise in a room full of people.
+test = ["pytest", "httpx", "numpy"]
+
+# The mixer's own dependencies, kept out of the base install so that musicbox
+# still starts on a machine with no sound card and no BLAS. app.py imports
+# mixer_client (a unix socket and a shlex parser), never mixer, so the API
+# process never needs either of these.
+#
+# Both are in the binary cache for aarch64-linux on the Pi (verified: 13
+# paths, 27.80 MiB download, zero source builds). That matters more than it
+# sounds: this box boots from an SD card and has wedged itself twice compiling
+# things, so anything that is not cached is effectively not available.
+mixer = ["numpy", "pyalsaaudio"]
 
 [project.scripts]
 musicbox-server = "musicbox.__main__:main"
 # Stdio MCP server for clients that will not speak HTTP. It controls a musicbox
 # over HTTP at MUSICBOX_URL; it does not start one.
 musicbox-mcp = "musicbox.mcp_server:main"
+# The mixer runs as its own process and its own systemd unit, so that a fault
+# in the audio loop cannot take the HTTP API down with it and vice versa. Run
+# it by hand against a file to hear what it does without touching the speaker:
+#   musicbox-mixer --no-fifo --music song.wav --out /tmp/mix.wav \
+#     --sfx-dir ./sfx --cache-dir /tmp/pcm --socket "" \
+#     --fire airhorn@1 --fire airhorn@1.3 --duration 6
+musicbox-mixer = "musicbox.mixer:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

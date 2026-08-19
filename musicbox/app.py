@@ -27,6 +27,10 @@ from pydantic import BaseModel, Field
 from . import logs
 from .board import BOARD_HTML
 from .config import Config
+# mixer_client only, never mixer: the mixer needs numpy and an ALSA device, and
+# this process has to start on a laptop with neither. The client is a unix
+# socket and a shlex parser and nothing else.
+from .mixer_client import MixerClient, MixerUnavailable
 from .prefetch import PrefetchError, Prefetcher
 from .ma_client import (
     BUFFERED_DETAIL,
@@ -63,6 +67,16 @@ SFX_EXTENSIONS = (".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus")
 OVER_NOTE = (
     "Music Assistant has no ducking. The music is silenced for the length of the "
     "drop and rejoins the track wherever it got to, it does not play underneath."
+)
+
+# The other half of that sentence, for when musicbox-mixer is running. It is a
+# different note rather than a flag on the old one because a caller reading the
+# answer has to be able to tell the two behaviours apart without knowing this
+# feature exists: they SOUND completely different.
+MIXER_NOTE = (
+    "Played through musicbox-mixer: the effect is layered on top of the music "
+    "and the music ducks under it instead of stopping. Pressing again while it "
+    "plays adds another copy rather than waiting in line."
 )
 
 
@@ -1148,6 +1162,22 @@ def get_prefetcher() -> Prefetcher | None:
     return _PREFETCHER
 
 
+# O cliente do mixer segue exatamente a mesma decisao do prefetcher acima, e
+# pelo mesmo motivo: perform_sfx e chamado da rota HTTP e do backend MCP, e
+# nenhum dos dois carrega o Config. Existe um cliente por processo, criado no
+# create_app, e None quando o mixer esta desligado, que e o default.
+_MIXER: MixerClient | None = None
+
+
+def set_mixer(mixer: MixerClient | None) -> None:
+    global _MIXER
+    _MIXER = mixer
+
+
+def get_mixer() -> MixerClient | None:
+    return _MIXER
+
+
 async def localize_media(media: str) -> dict[str, Any]:
     """Troca uma URL remota pela copia local, baixando se preciso.
 
@@ -1574,6 +1604,70 @@ async def perform_drop(ma: MAClient, url: str, mode: str) -> dict[str, Any]:
     }
 
 
+async def perform_sfx(
+    ma: MAClient, path: Path, url: str, mode: str, mixer: MixerClient | None = None
+) -> dict[str, Any]:
+    """Play a sound already on the box, by the best path available.
+
+    Two paths, and the answer always says which one was taken, because they
+    sound different and somebody debugging at an event needs to know which one
+    they are listening to:
+
+      "mixer"        musicbox-mixer layers the effect on top of the music and
+                     ducks the music underneath it. Retriggers are free, so
+                     pressing the same key ten times gives ten sounds.
+      "announcement" Music Assistant's announcement path, which is what this
+                     has always done. The music is SILENCED for the length of
+                     the effect, and MA serialises announcements: four presses
+                     0.35s apart measured out as four playbacks about 3 seconds
+                     apart on the live box.
+
+    The mixer is used for mode "over" only. "over" is a promise the
+    announcement path could never keep, so when the mixer is there it is the
+    honest implementation of it; "cut" explicitly means pause, play and resume,
+    which is a queue operation and belongs to MA either way.
+
+    Any mixer failure falls straight through to the announcement path and says
+    so in `reason`. A sound effect that refuses to fire because the mixer is
+    down is strictly worse than one that fires the old way: the old way is what
+    the box did yesterday, and it works.
+    """
+    if mixer is not None and mixer.enabled and mode == "over":
+        try:
+            answer = await mixer.play(path.stem)
+            return {
+                "ok": True,
+                "mode_requested": mode,
+                "mode_used": "over",
+                "path": "mixer",
+                "fell_back": False,
+                "voices": _int_or_none(answer.get("voices")),
+                "note": MIXER_NOTE,
+                "url": url,
+            }
+        except MixerUnavailable as exc:
+            # warn and not error: the fallback works, the box keeps playing,
+            # and this is exactly the line someone greps for when the effects
+            # suddenly start cutting the music again.
+            logs.warn("sfx_mixer_unavailable", sfx=path.stem, error=str(exc))
+            result = await perform_drop(ma, url, mode)
+            result["path"] = "announcement"
+            result["fell_back"] = True
+            result["reason"] = f"the mixer was not usable, played through Music Assistant: {exc}"
+            return result
+
+    result = await perform_drop(ma, url, mode)
+    result["path"] = "announcement"
+    return result
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 # ── app ───────────────────────────────────────────────────────────────────────
 
 
@@ -1610,6 +1704,11 @@ def create_app(config: Config | None = None, ma: MAClient | None = None) -> Fast
         else None
     )
 
+    # None unless MUSICBOX_MIXER is on. That is the whole opt-in: with it off
+    # there is no client, perform_sfx never looks at a socket, and every sfx
+    # takes the same announcement path it took yesterday.
+    set_mixer(MixerClient(config.mixer) if config.mixer.enable else None)
+
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
         logs.log(
@@ -1626,6 +1725,11 @@ def create_app(config: Config | None = None, ma: MAClient | None = None) -> Fast
             # leaving that fact only in the README.
             mcp=MCP_PATH,
             mcp_auth=False,
+            # Said out loud at every start, because "why did the music stop for
+            # that airhorn" and "why did it not" have the same one word answer
+            # and this is the line that gives it.
+            mixer=config.mixer.enable,
+            mixer_socket=str(config.mixer.socket) if config.mixer.enable else None,
         )
         # start() only spawns the supervisor. It deliberately does not wait for
         # a connection: MA may well come up after us, and a startup that blocks
@@ -1740,6 +1844,7 @@ def create_app(config: Config | None = None, ma: MAClient | None = None) -> Fast
     @open_router.get("/health")
     async def health() -> dict[str, Any]:
         info = ma.server_info or await ma.probe_info()
+        mixer = get_mixer()
         return {
             "ok": True,
             "ma_connected": ma.connected,
@@ -1763,6 +1868,15 @@ def create_app(config: Config | None = None, ma: MAClient | None = None) -> Fast
             "last_error": ma.last_error or None,
             "sfx_count": len(list_sfx(config.sfx_dir)),
             "auth_required": bool(config.token),
+            # Reported from the client's last outcome, NOT by pinging here.
+            # /health is polled by the soundboard every 5 seconds and a probe
+            # per poll would put the mixer's control thread on the critical
+            # path of a page refresh for no new information. `null` means
+            # nothing has been played since this process started, which is the
+            # truth. GET /mixer is the endpoint that actually asks.
+            "mixer_enabled": config.mixer.enable,
+            "mixer_ok": mixer.last_ok if mixer else None,
+            "mixer_error": mixer.last_error if mixer else None,
         }
 
     @open_router.get("/sfx/file/{name}")
@@ -1891,9 +2005,59 @@ def create_app(config: Config | None = None, ma: MAClient | None = None) -> Fast
         path = resolve_sfx(config.sfx_dir, name)
         if path is None:
             raise HTTPException(status_code=404, detail=f"no sfx named {name!r}")
-        result = await perform_drop(ma, sfx_url(request, path.name), chosen)
+        # The URL is still resolved even when the mixer takes the call. It
+        # costs nothing, it is what the fallback needs the moment the mixer
+        # answers badly, and the answer carrying it means a caller can always
+        # see what MA would have been asked to fetch.
+        result = await perform_sfx(
+            ma, path, sfx_url(request, path.name), chosen, get_mixer()
+        )
         result["sfx"] = path.stem
         return result
+
+    # ── mixer ─────────────────────────────────────────────────────────────────
+    # Never raises and never 503s. This is the endpoint someone hits at an
+    # event to find out why the effects sound wrong, and an endpoint that
+    # answers with an error page in that moment is one more thing to debug.
+    # `ok: false` with a sentence is the answer.
+    @api.get("/mixer")
+    async def mixer_status() -> dict[str, Any]:
+        mixer = get_mixer()
+        if mixer is None or not mixer.enabled:
+            return {
+                "ok": True,
+                "enabled": False,
+                "detail": "the mixer is off, so sfx go through Music Assistant announcements",
+            }
+        try:
+            stats = await mixer.stats()
+        except MixerUnavailable as exc:
+            return {
+                "ok": False,
+                "enabled": True,
+                "socket": str(mixer.socket_path),
+                "error": "mixer_unavailable",
+                "detail": str(exc),
+            }
+        return {"ok": True, "enabled": True, "socket": str(mixer.socket_path), **stats}
+
+    @api.post("/mixer/stop")
+    async def mixer_stop() -> dict[str, Any]:
+        """Cut every effect voice immediately. The music is untouched.
+
+        The panic button: somebody holds a key down, eight voices of airhorn
+        are playing, and the fastest fix has to be one request and not a
+        service restart. The duck still releases over its normal fade, so this
+        does not put a click through the PA.
+        """
+        mixer = get_mixer()
+        if mixer is None or not mixer.enabled:
+            return {"ok": True, "enabled": False, "stopped": False}
+        try:
+            await mixer.stop()
+        except MixerUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {"ok": True, "enabled": True, "stopped": True}
 
     @api.post("/skip")
     async def skip() -> dict[str, Any]:

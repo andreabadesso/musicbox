@@ -18,6 +18,25 @@
 # opens an ALSA device. That split is what lets MA stay in a container with no
 # device passthrough at all.
 #
+# ── And with services.musicbox.mixer.enable, one link changes ───────────────
+#
+#   ... MA's snapserver -> snapclient --player file:filename=<fifo>
+#                                        |
+#                                   musicbox-mixer  <- effects arrive here, over
+#                                        |             a unix socket from musicbox
+#                                   bluez-alsa -> Bluetooth speaker
+#
+# snapclient stops opening the ALSA device and becomes a producer of raw PCM;
+# musicbox-mixer owns the speaker and sums sound effects on top of the music,
+# ducking the music while they play. That is the only place a second sound can
+# be added on this box: A2DP is one exclusive stream and bluez-alsa will not mix
+# it, and Music Assistant's announcement path silences the music instead of
+# layering, and serialises announcements on top of that (measured: four presses
+# 0.35s apart came out about 3s apart).
+#
+# It is OFF by default and everything below assumes it stays that way until
+# someone turns it on deliberately, having listened to it first.
+#
 # ── Why Music Assistant in podman, and not native ───────────────────────────
 # Because on this host the native path is measured in hours. The Pi 5 runs the
 # raspberry-pi-nix overlay, which replaces libcamera and libpisp; that forces a
@@ -212,6 +231,111 @@ let
   # and format conversion to whatever A2DP negotiated is handled for us and
   # snapclient can be left at the server's native 48000:16:2.
   bluealsaPcm = "bluealsa:DEV=${cfg.bluetoothAudio.speakerMac},PROFILE=a2dp";
+
+  # ── The mixer's paths and package ───────────────────────────────────────────
+  # One runtime directory holds both the FIFO snapclient writes into and the
+  # control socket musicbox talks to. systemd creates it at start and removes it
+  # at stop, which is exactly the lifetime both files want: a FIFO surviving the
+  # process that owned it is how you get snapclient writing into a pipe nobody
+  # is draining.
+  #
+  # It is owned by the mixer's user with group `audio` and mode 0750, so the two
+  # processes that have business here (snapclient, which is in `audio`, and
+  # musicbox, which this module puts in `audio` when the mixer is on) can
+  # traverse it and nothing else can.
+  mixerRuntimeDir = "/run/musicbox-mixer";
+
+  # Where the mixer sees the sound effects. NOT cfg.sfxDir, and that difference
+  # is the whole reason this exists.
+  #
+  # musicbox runs under DynamicUser, so its StateDirectory really lives at
+  # /var/lib/private/musicbox and /var/lib/musicbox is a symlink systemd makes.
+  # /var/lib/private is mode 0700 root, with no group and no exception, so ANY
+  # other user opening /var/lib/musicbox/sfx is denied at the traversal, not at
+  # the file. Mounting the directory somewhere that does not go through
+  # /var/lib/private is the only fix that does not involve taking musicbox off
+  # DynamicUser and migrating its state on a box that is mid-event.
+  #
+  # PID 1 does the mount as root before dropping privileges, so the 0700 is not
+  # in the way there.
+  mixerSfxDir = "${mixerRuntimeDir}/sfx";
+  mixerSfxSource = "/var/lib/private/${sfxStateDir}";
+
+  # The mixer opens the ALSA device that snapclient used to open, so by default
+  # it is the same device string, built the same way.
+  mixerDevice =
+    if cfg.mixer.device != null then cfg.mixer.device else bluealsaPcm;
+
+  # numpy and pyalsaaudio are an opt-in of the package build (nix/package.nix,
+  # `withMixer`) rather than an unconditional dependency, so that a deployment
+  # with the mixer off keeps byte for byte the closure it has today. Flipping it
+  # here means nobody has to know the argument exists.
+  #
+  # The `? override` guard is for the case where someone points `package` at a
+  # derivation that did not come from callPackage. Rather than fail evaluation
+  # for a case that may well be deliberate (a locally patched build that already
+  # has both libraries), fall through and warn: the failure then is a loud
+  # ImportError on the mixer's first start, not a broken rebuild.
+  mixerPackage =
+    if cfg.package ? override
+    then cfg.package.override { withMixer = true; }
+    else cfg.package;
+
+  # Runs as the mixer's own user inside its RuntimeDirectory, before the mixer
+  # itself. Two jobs, and the first one is the important one.
+  #
+  # snapclient's file player opens its target with fopen(path, "wb"), which is
+  # O_WRONLY|O_CREAT|O_TRUNC. If the path is missing when snapclient gets there,
+  # it does not fail: it CREATES A REGULAR FILE and writes 9600 bytes into it
+  # every 50 ms, forever, into a tmpfs, with the unit green and the room silent.
+  # Creating the FIFO from the unit rather than from the application closes that
+  # window completely, because the node exists as a FIFO before snapclient is
+  # allowed to start at all.
+  #
+  # `mkfifo -m` applies the mode as chmod does, so the umask is not involved and
+  # the 0660 is exact: owner is the mixer, group is `audio`, and snapclient is
+  # in `audio`. That is what lets snapclient open it for writing.
+  #
+  # AN EXISTING FIFO IS LEFT ALONE, which together with
+  # RuntimeDirectoryPreserve = "restart" below is what makes a mixer restart
+  # survivable for snapclient. snapclient holds a file descriptor on this
+  # inode; unlinking it and making a new node does not close that descriptor,
+  # it orphans it, and snapclient's file player has no error handling on its
+  # fwrite. It would then write 9600 bytes every 50 ms into a deleted inode
+  # forever, with its unit active and the room silent. Keeping the same node
+  # means the mixer can crash and come back and snapclient never notices more
+  # than a gap.
+  #
+  # Second job: clear a stale socket. That one IS unlinked every time, because
+  # a socket left behind by a crash makes bind() fail with EADDRINUSE, and a
+  # mixer that will not start is a mixer that hangs snapclient.
+  #
+  # Third job: make sure the sfx mount point exists even when the mount was
+  # skipped, which happens on a box where musicbox has never started and so has
+  # no state directory yet. That turns "the effects directory is missing" into
+  # "the effects directory is empty", and the difference matters more than it
+  # looks: a mixer that crash-loops takes the FIFO's only reader with it, and
+  # snapclient then blocks in fwrite and stops reading the network too. A mixer
+  # that comes up with no effects still passes the music through.
+  mixerPrepare = pkgs.writeShellScript "musicbox-mixer-prepare" ''
+    set -euo pipefail
+    ${pkgs.coreutils}/bin/rm -f ${lib.escapeShellArg cfg.mixer.socket}
+    if [ ! -p ${lib.escapeShellArg cfg.mixer.fifo} ]; then
+      # Not a fifo: either missing, or a regular file something created by
+      # opening the path for writing before we got here. Both have to become a
+      # fifo, and the second one is exactly the failure this whole script
+      # exists to prevent, so it is loud.
+      if [ -e ${lib.escapeShellArg cfg.mixer.fifo} ]; then
+        echo "musicbox-mixer: ${cfg.mixer.fifo} existed and was not a fifo, replacing it" >&2
+      fi
+      ${pkgs.coreutils}/bin/rm -f ${lib.escapeShellArg cfg.mixer.fifo}
+      ${pkgs.coreutils}/bin/mkfifo -m 0660 ${lib.escapeShellArg cfg.mixer.fifo}
+    else
+      # Preserved across a restart. Re-assert the mode rather than trust it.
+      ${pkgs.coreutils}/bin/chmod 0660 ${lib.escapeShellArg cfg.mixer.fifo}
+    fi
+    ${pkgs.coreutils}/bin/mkdir -p ${lib.escapeShellArg mixerSfxDir}
+  '';
 
   # DynamicUser + StateDirectory is the whole ownership story for the sfx dir:
   # systemd creates it, chowns it to the transient uid, and keeps it across
@@ -588,6 +712,258 @@ in
         '';
       };
     };
+
+    # ── The software mixer ────────────────────────────────────────────────────
+    # Everything here is off by default and has to stay that way. The box this
+    # runs on is playing music to a room; the mixer takes over the one process
+    # that owns the ALSA device, so switching it on is a change to the audio
+    # path itself, not a feature flag on top of it.
+    mixer = {
+      enable = mkEnableOption ''
+        the software mixer, which layers sound effects over the music instead of
+        interrupting it.
+
+        What it changes: snapclient stops opening the ALSA device and writes raw
+        PCM into a FIFO instead (`--player file:filename=`), and a new
+        musicbox-mixer service reads that FIFO, mixes effect voices on top of
+        the music, ducks the music while a voice plays, and writes the result to
+        the Bluetooth speaker. musicbox then triggers effects over a unix socket
+        rather than through Music Assistant's announcement path.
+
+        Why it exists: MA's announcement path silences the music, plays the
+        effect and resumes, and MA serialises announcements. Measured on this
+        box, four presses of the same effect 0.35s apart came out roughly 3s
+        apart, because each one waits for the previous to finish through the
+        snapserver and the A2DP buffers. MA has no ducking option (every
+        announce_* key was checked) and bluez-alsa will not mix a second stream
+        into a single A2DP transport, so there was nowhere else for the sound to
+        go. Doing the mix ourselves is the only place it can happen.
+
+        With this off, every unit in the chain is exactly what it was before this
+        option existed, including the musicbox package's own closure: the two
+        extra Python libraries the mixer needs are an argument of the package
+        build (nix/package.nix, `withMixer`) that only this option flips
+      '';
+
+      duckDb = mkOption {
+        type = types.float;
+        default = -12.0;
+        example = -9.0;
+        description = ''
+          How far the music is attenuated while an effect voice is playing, in
+          decibels. Negative, because it is an attenuation: -12 dB is a quarter
+          of the amplitude, which is enough for a voice to sit clearly on top
+          without the music appearing to stop.
+
+          Expressed in dB and not as a ratio on purpose. snapclient keeps
+          `--mixer software` even when it writes to the FIFO, so the music
+          arriving at the mixer has ALREADY been scaled by whatever volume MA is
+          set to. A duck expressed as "multiply by 0.25" is the same relative
+          change at any volume; a duck expressed as "bring it down to level X"
+          would be wrong at every volume but one.
+
+          0.0 disables the duck and simply sums the effect on top. That is
+          louder than it sounds and is the setting most likely to clip, which
+          the mixer handles by clipping properly rather than by wrapping, but
+          clipping still sounds like clipping.
+        '';
+      };
+
+      periodMs = mkOption {
+        type = types.int;
+        default = 20;
+        description = ''
+          The mixer's block size, in milliseconds. It is the unit of work for
+          the whole loop: read this much music from the FIFO, mix this much of
+          every active voice, write this much to ALSA.
+
+          20 ms is 960 frames at 48000:16:2, and that number was chosen against
+          measurements on this box rather than by feel:
+
+          - It is the mixer's own contribution to trigger latency. An effect
+            starts at the next block boundary, so this is at most 20 ms of the
+            roughly 220 to 420 ms it takes a press to become audible, almost all
+            of which is the 200 ms ALSA buffer and the opaque A2DP buffer that
+            are already in today's path.
+          - It divides snapclient's producer chunk cleanly. The file player
+            writes exactly 9600 bytes (50 ms) every 50 ms and that 50 is a
+            compile-time constant with no option for it, so 20 ms gives a 1:2.5
+            ratio instead of an awkward one.
+          - The work per block is 28 to 51 us measured with one to four voices,
+            against a 20000 us budget. That is a safety factor of roughly 400,
+            which is the right margin on a box that has wedged itself twice.
+
+          Going smaller buys you a few milliseconds of trigger latency and costs
+          you wakeups: 5 ms is 200 wakeups a second and 200 chances to be late.
+          Going larger is the wrong direction for a feature whose entire point is
+          that the effect lands when the key is pressed.
+        '';
+      };
+
+      periods = mkOption {
+        type = types.int;
+        default = 10;
+        example = 6;
+        description = ''
+          Number of `periodMs` periods in the ALSA ring buffer, so the buffer
+          depth is periodMs * periods. The default 20 * 10 is 200 ms, and 200 ms
+          is not a round number someone liked: it is the one depth this box has
+          been shown to survive.
+
+          80 ms, which is snapclient's own default, stutters: 484 XRUNs in five
+          minutes. 500 ms stops playing entirely, because the client then asks
+          for more audio than the source has ready and logs "Not enough frames
+          available ... Failed to get chunk" forever while every service reports
+          healthy. That second failure is the one to be afraid of, and it is the
+          reason this option is not the first knob to reach for.
+
+          It is nevertheless the only real lever on trigger latency: the ALSA
+          buffer is the largest term in the roughly 220 to 420 ms between a key
+          press and a sound. If you want the effects tighter, walk this down
+          towards 6 (120 ms) WHILE LISTENING, one step at a time. Do not walk it
+          down blind, and do not walk it down during an event.
+        '';
+      };
+
+      voices = mkOption {
+        type = types.int;
+        default = 8;
+        description = ''
+          Maximum number of effect voices sounding at once. Past this the oldest
+          voice is dropped rather than the newest refused, so hammering a key
+          never stops responding.
+
+          Eight is about taste, not CPU: four voices at a 20 ms period measured
+          51 us of a 20000 us budget on this Pi, which is 0.26% of one core of
+          four. The number that matters is that rapid fire on one key adds
+          voices rather than restarting one, so pressing repeatedly gives the
+          stutter effect people expect from a sampler instead of a single sound
+          that keeps starting over.
+        '';
+      };
+
+      gainDb = mkOption {
+        type = types.float;
+        default = 0.0;
+        example = 3.0;
+        description = ''
+          Gain applied to every effect voice, in decibels, before it is summed
+          with the ducked music. This is the "effects at their own volume" knob,
+          and it is separate from `duckDb` on purpose: duck moves the music,
+          gain moves the effect, and an event usually wants one of the two
+          rather than both.
+
+          Positive values are allowed and are the normal case for a quiet sample,
+          but they are also the fastest way to clip. The mixer sums in float and
+          clips properly, so the result is honest clipping rather than the int16
+          wraparound that sounds like tearing, and clipping still sounds bad.
+        '';
+      };
+
+      pipeBytes = mkOption {
+        type = types.int;
+        default = 16384;
+        example = 65536;
+        description = ''
+          Capacity of the FIFO between snapclient and the mixer, in bytes, set
+          with F_SETPIPE_SZ. At 48000:16:2 there are 192 bytes per millisecond,
+          so 16384 is 85 ms.
+
+          The kernel default on this box is 262144 bytes, which is 1365 ms of
+          audio: if the pipe ever fills, that is latency added invisibly and it
+          never drains back down. Capping it turns a mixer stall into immediate
+          backpressure on snapclient instead of a growing delay nobody can see.
+
+          The granularity is coarse and not a choice: this Pi 5 kernel uses
+          16384 byte pages, so F_SETPIPE_SZ rounds to a page. Asking for 4096 or
+          16384 both give 16384 (85 ms); asking for 38400 or 65536 both give
+          65536 (341 ms). There is nothing in between, so this option really has
+          two useful values. 65536 is the more forgiving one if the FIFO turns
+          out to run dry over a long evening.
+        '';
+      };
+
+      device = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        defaultText = lib.literalExpression ''"bluealsa:DEV=''${speakerMac},PROFILE=a2dp"'';
+        example = "default";
+        description = ''
+          ALSA PCM the mixer writes to, handed straight to snd_pcm_open. Null
+          means the same bluealsa PCM snapclient opens today, built from
+          `bluetoothAudio.speakerMac`, which is what you want in production.
+
+          It has to be configuration and cannot be discovered: bluez-alsa ships
+          no ALSA namehints, so `alsaaudio.pcms()` on this box returns no entry
+          containing "bluealsa" at all, with or without ALSA_PLUGIN_DIR. Set it
+          to something like "default" or "null" only to test the mixer without
+          taking the speaker.
+        '';
+      };
+
+      fifo = mkOption {
+        type = types.str;
+        default = "/run/musicbox-mixer/snapfifo";
+        description = ''
+          The FIFO snapclient writes raw PCM into and the mixer reads music out
+          of. Must live in /run/musicbox-mixer: that is the mixer unit's
+          RuntimeDirectory, which is the only directory systemd creates with the
+          ownership and mode both processes need, and cleans up afterwards.
+
+          The unit creates the node itself with `mkfifo -m 0660` before the mixer
+          starts, and that ordering is not cosmetic. snapclient's file player
+          opens its target with fopen(..., "wb"), so a missing path becomes a
+          REGULAR FILE that quietly accumulates 9600 bytes every 50 ms in a
+          tmpfs while every unit reports healthy and the room stays silent.
+        '';
+      };
+
+      socket = mkOption {
+        type = types.str;
+        default = "/run/musicbox-mixer/control.sock";
+        description = ''
+          Unix socket the mixer listens on for trigger commands, and the only
+          thing musicbox needs in order to use the mixer: MUSICBOX_MIXER_SOCKET
+          is set on the musicbox unit when this is enabled and unset when it is
+          not, so the fallback to Music Assistant's announcement path is decided
+          by one environment variable being present.
+
+          A unix socket rather than a second HTTP port because there is no
+          second port to defend, no token to plumb, and the filesystem
+          permissions are the whole access control: mode 0660 owned by the mixer
+          with group `audio`, in a 0750 directory.
+
+          Must live in /run/musicbox-mixer, for the same RuntimeDirectory reason
+          as `fifo`.
+        '';
+      };
+
+      sampleFormat = mkOption {
+        type = types.str;
+        default = "48000:16:2";
+        example = "";
+        description = ''
+          Passed to snapclient as `--sampleformat` when the mixer is enabled, so
+          the FIFO is guaranteed to carry the format the mixer is about to
+          interpret. Empty string means do not pass it at all.
+
+          This exists because of a failure with no error message anywhere. The
+          FIFO carries headerless PCM: there is no format in the bytes. The
+          mixer is compiled around 48000:16:2 (the live stream today logs
+          "Codec: flac, sampleformat: 48000:16:2"), and if Music Assistant ever
+          changes what its snapserver produces, the same bytes get reinterpreted
+          at the wrong rate and everything plays at the wrong pitch while every
+          service reports healthy. Pinning it here moves that failure into
+          snapclient's resampler, where it is at worst audible and at best
+          logged, instead of leaving it in the mixer where it is neither.
+
+          Setting it to the format the stream already has should be a no-op in
+          snapclient. If you ever suspect otherwise, this is the option to empty
+          out first, because it is the only argument here that touches the audio
+          data rather than routing it.
+        '';
+      };
+    };
   };
 
   config = mkIf cfg.enable (lib.mkMerge [
@@ -642,6 +1018,19 @@ in
           # Unbuffered, so a crash traceback is in the journal rather than lost
           # in a pipe buffer that never got flushed.
           PYTHONUNBUFFERED = "1";
+        }
+        # MUSICBOX_MIXER is the switch and MUSICBOX_MIXER_SOCKET is where to
+        # knock. musicbox uses the mixer for POST /sfx and the MCP sfx tool when
+        # the switch is on and the socket answers, and falls back to Music
+        # Assistant's announcement path when it does not, with the response
+        # saying which path it took.
+        #
+        # Both unset when the mixer is off, so there is no way for this unit to
+        # be pointed at a socket that this module did not create.
+        //
+        lib.optionalAttrs cfg.mixer.enable {
+          MUSICBOX_MIXER = "1";
+          MUSICBOX_MIXER_SOCKET = cfg.mixer.socket;
         };
 
         serviceConfig = {
@@ -678,7 +1067,7 @@ in
 
           LoadCredential =
             lib.optional (cfg.tokenFile != null) "token:${cfg.tokenFile}"
-            ++ lib.optional (cfg.maTokenFile != null) "ma-token:${cfg.maTokenFile}";
+              ++ lib.optional (cfg.maTokenFile != null) "ma-token:${cfg.maTokenFile}";
 
           # ── Hardening ────────────────────────────────────────────────────
           NoNewPrivileges = true;
@@ -720,6 +1109,32 @@ in
           # rather than as a policy denial. Not worth the debugging time for a
           # service that is already unprivileged, namespaced and syscall
           # filtered.
+        }
+        # ── What talking to the mixer costs this unit ────────────────────────
+        # Two additions, both only when the mixer is on, and both are about
+        # reaching one unix socket.
+        //
+        lib.optionalAttrs cfg.mixer.enable {
+          # The socket is mode 0660 owned by the mixer with group `audio`, so
+          # connect() needs this. It also hands musicbox the ability to talk to
+          # bluez-alsa over D-Bus, which it has no code to do; that is the price
+          # of reusing the group snapclient and the mixer already share rather
+          # than inventing a third one for a single socket.
+          #
+          # This is additive to the existing DynamicUser identity, not a
+          # replacement for it: musicbox keeps its transient uid.
+          SupplementaryGroups = [ "audio" ];
+
+          # ProtectSystem = "strict" mounts the whole hierarchy read-only, /run
+          # included. connect() on a unix socket should not need the mount to be
+          # writable, since it modifies no inode, but "should not" is not a thing
+          # to find out on a live box, and the cost of being sure is one line.
+          #
+          # The `-` prefix makes it non-fatal when the path is missing, which is
+          # the normal state before the mixer has ever started: without it,
+          # musicbox would refuse to start whenever the mixer was down, and
+          # taking the HTTP API out with the mixer is the opposite of a fallback.
+          ReadWritePaths = [ "-${mixerRuntimeDir}" ];
         };
       };
 
@@ -968,10 +1383,29 @@ in
         description = "Snapcast client feeding the Bluetooth speaker";
         wantedBy = [ "multi-user.target" ];
         after = [ "bluealsa.service" "musicbox-bt-connect.service" ]
-          ++ lib.optional cfg.musicAssistant.enable "podman-music-assistant.service";
+          ++ lib.optional cfg.musicAssistant.enable "podman-music-assistant.service"
+          # The mixer must own the FIFO before snapclient reaches for it, and
+          # `after` is the load-bearing half of that. snapcast's FilePlayer does
+          # its fopen(..., "wb") in the CONSTRUCTOR, and glibc's "w" on a FIFO
+          # blocks until a reader exists. Start snapclient first and it does not
+          # crash and does not restart-loop: it hangs inside the constructor with
+          # the unit reporting active and the room silent, which is this box's
+          # worst failure mode.
+          ++ lib.optional cfg.mixer.enable "musicbox-mixer.service";
         wants = [ "bluealsa.service" "musicbox-bt-connect.service" ];
         # An open PCM does not survive a bluealsa restart; cycle with it.
-        partOf = [ "bluealsa.service" ];
+        #
+        # The mixer gets the same treatment for the mirror-image reason: with the
+        # mixer gone the FIFO has no reader, and snapclient's fwrite has no error
+        # handling and runs on its single io_context, so it blocks there and stops
+        # reading the network too. Better to cycle it deliberately than to leave a
+        # process wedged on a pipe.
+        partOf = [ "bluealsa.service" ]
+          ++ lib.optional cfg.mixer.enable "musicbox-mixer.service";
+        # partOf propagates restart, bindsTo propagates "the thing I depend on
+        # went away". Both, because both happen: a rebuild restarts the mixer and
+        # a crash stops it.
+        bindsTo = lib.optional cfg.mixer.enable "musicbox-mixer.service";
 
         environment = {
           # alsa-lib resolves `type bluealsa` by dlopening
@@ -987,7 +1421,7 @@ in
 
         serviceConfig = {
           Type = "simple";
-          ExecStart = lib.escapeShellArgs [
+          ExecStart = lib.escapeShellArgs ([
             "${snapcast}/bin/snapclient"
             # Positional URL, not -h/--host: those are deprecated as of 0.35.
             # Passing it explicitly also avoids snapclient falling back to mDNS
@@ -1001,11 +1435,42 @@ in
             # e tem teto dos dois lados: 80ms (o default) engasga, 500ms para
             # de tocar. Ver alsaBufferMs, que conta a historia inteira com os
             # numeros.
+            #
+            # With the mixer enabled this becomes the file player instead, and
+            # snapclient stops opening ALSA entirely: it writes the raw stream
+            # into a FIFO and musicbox-mixer owns the device from there. The
+            # option set was read off the running binary
+            # (`snapclient --player 'file:?'`) rather than guessed: filename and
+            # mode=[w|a] are the only two, and mode=w is the default, spelled out
+            # here so an upstream default change cannot silently start appending
+            # to a pipe.
+            #
+            # Nothing about buffer_time or fragments applies on this branch. The
+            # ALSA buffer they size is the mixer's problem now, and it reproduces
+            # the same 200 ms depth this box measured its way to.
             "--player"
-            "alsa:buffer_time=${toString cfg.bluetoothAudio.alsaBufferMs},fragments=${toString cfg.bluetoothAudio.alsaFragments}"
-            # Raw ALSA PCM name, handed straight to snd_pcm_open.
+            (
+              if cfg.mixer.enable
+              then "file:filename=${cfg.mixer.fifo},mode=w"
+              else "alsa:buffer_time=${toString cfg.bluetoothAudio.alsaBufferMs},fragments=${toString cfg.bluetoothAudio.alsaFragments}"
+            )
+          ]
+          # Raw ALSA PCM name, handed straight to snd_pcm_open. Dropped when the
+          # mixer is on, because snapclient no longer opens a device and leaving
+          # a soundcard argument on a process that ignores it is how the next
+          # person spends an hour looking at the wrong end of the chain.
+          ++ lib.optionals (!cfg.mixer.enable) [
             "--soundcard"
             bluealsaPcm
+          ]
+          # Pin the FIFO's format so a change in what MA's snapserver produces
+          # fails in snapclient's resampler instead of silently reinterpreting
+          # headerless PCM at the wrong rate downstream. See mixer.sampleFormat.
+          ++ lib.optionals (cfg.mixer.enable && cfg.mixer.sampleFormat != "") [
+            "--sampleformat"
+            cfg.mixer.sampleFormat
+          ]
+          ++ [
             # Mandatory with bluez-alsa. The hardware mixer path goes through
             # bluealsa's ctl plugin and is broken in this combination
             # (snapcast issue #1317). `software` is the current default; pinned
@@ -1043,7 +1508,7 @@ in
             "musicbox"
             "--logsink"
             "stdout"
-          ];
+          ]);
           User = "snapclient";
           Group = "snapclient";
           SupplementaryGroups = [ "audio" ];
@@ -1071,6 +1536,333 @@ in
       # Not made an option because the frozen interface contract does not have
       # one; run it by hand or add a local oneshot:
       #   systemd.services.rfkill-wifi = { ... ExecStart = "rfkill block wifi"; };
+    })
+
+    # ── The software mixer ────────────────────────────────────────────────────
+    # The chain with this on:
+    #
+    #   MA -> snapserver -> snapclient --player file:filename=<fifo>
+    #                                     |
+    #                                musicbox-mixer   <- effects triggered here
+    #                                     |
+    #                                ALSA (bluealsa) -> speaker
+    #
+    # snapclient stops being the process that owns the speaker and becomes a
+    # producer of raw PCM. Everything downstream of the FIFO is ours, which is
+    # the only place a second sound can be added to a single A2DP stream: bluez
+    # -alsa will not mix one, and MA has no ducking to offer.
+    (mkIf cfg.mixer.enable {
+      assertions = [
+        {
+          assertion = cfg.bluetoothAudio.enable;
+          message =
+            "services.musicbox.mixer.enable requires bluetoothAudio.enable. The mixer "
+            + "replaces snapclient's ALSA output and opens the bluealsa PCM itself, so "
+            + "without that chain there is no snapclient to reroute, no bluealsa to open "
+            + "and no speaker MAC to derive a device from.";
+        }
+        {
+          assertion = lib.hasPrefix "${mixerRuntimeDir}/" cfg.mixer.fifo;
+          message =
+            "services.musicbox.mixer.fifo must live under ${mixerRuntimeDir} (got "
+            + "${cfg.mixer.fifo}). That directory is the unit's RuntimeDirectory: systemd "
+            + "creates it owned by the mixer with group audio and mode 0750, which is what "
+            + "lets snapclient open the FIFO for writing, and removes it on stop so a FIFO "
+            + "never outlives the process that was draining it.";
+        }
+        {
+          assertion = lib.hasPrefix "${mixerRuntimeDir}/" cfg.mixer.socket;
+          message =
+            "services.musicbox.mixer.socket must live under ${mixerRuntimeDir} (got "
+            + "${cfg.mixer.socket}). Same reason as mixer.fifo: it is the one directory "
+            + "whose ownership and lifetime systemd manages for this unit.";
+        }
+        {
+          # 5 ms is 240 frames and 200 wakeups a second, which is a lot of
+          # chances to be late for a few milliseconds of trigger latency. 50 ms
+          # is snapclient's own producer chunk, past which the mixer's block
+          # size starts to dominate the very latency it exists to reduce.
+          assertion = cfg.mixer.periodMs >= 5 && cfg.mixer.periodMs <= 50;
+          message =
+            "services.musicbox.mixer.periodMs must be between 5 and 50 (got "
+            + "${toString cfg.mixer.periodMs}). Below 5 the wakeup rate buys nothing an "
+            + "A2DP link can deliver; above 50 the mixer's own block size becomes the "
+            + "largest term in trigger latency, which is the thing it exists to shrink.";
+        }
+        {
+          # The two numbers in this message are measurements from this box, not
+          # margins of taste. 80 ms stuttered 484 times in 5 minutes; 500 ms
+          # stopped producing sound at all while every unit stayed green. The
+          # window between them is where this has to live.
+          assertion =
+            let ms = cfg.mixer.periodMs * cfg.mixer.periods; in
+            ms >= 100 && ms <= 400;
+          message =
+            "services.musicbox.mixer periodMs * periods is the ALSA buffer depth in "
+            + "milliseconds and must land between 100 and 400 (got "
+            + "${toString cfg.mixer.periodMs} * ${toString cfg.mixer.periods} = "
+            + "${toString (cfg.mixer.periodMs * cfg.mixer.periods)}). Measured on this "
+            + "box: 80ms stutters, 484 XRUNs in 5 minutes. 500ms stops playing entirely, "
+            + "with 'Not enough frames available ... Failed to get chunk' repeating "
+            + "forever while every service reports healthy. 200ms is what works.";
+        }
+        {
+          assertion = cfg.mixer.duckDb <= 0.0;
+          message =
+            "services.musicbox.mixer.duckDb must be zero or negative (got "
+            + "${toString cfg.mixer.duckDb}). It is an attenuation applied to the music "
+            + "while an effect plays. A positive value would BOOST the music under the "
+            + "effect and clip, which is the opposite of ducking.";
+        }
+      ];
+
+      warnings = lib.optional (!(cfg.package ? override)) ''
+        services.musicbox.mixer is enabled but services.musicbox.package cannot be
+        overridden, so numpy and pyalsaaudio were not added to its build. If that
+        package does not already carry them, musicbox-mixer will fail at startup
+        with an ImportError. Build it with `withMixer = true` (see
+        nix/package.nix) or add both libraries yourself.
+      '';
+
+      # A static user, deliberately, and not DynamicUser. Two reasons, and the
+      # second one is the one that bites.
+      #
+      # 1. bluez-alsa's D-Bus policy grants send_destination=org.bluealsa to
+      #    user root and to GROUP audio, with no other exemption. Anything that
+      #    opens a bluealsa PCM has to be in `audio` or the open fails with
+      #    "Rejected send message ... destination=org.bluealsa", which alsa-lib
+      #    surfaces as a generic device error that reads like the speaker is not
+      #    connected. Measured directly: a user in users/wheel/networkmanager but
+      #    not audio gets exactly that denial. snapclient's unit is the model to
+      #    copy here, not musicbox's, which runs DynamicUser with no groups.
+      # 2. The FIFO and the socket live in a directory two other users have to
+      #    reach. Group ownership is the whole access control, and a uid that
+      #    changes on every boot makes that story harder to reason about for no
+      #    gain: this service owns no persistent state that needs the isolation.
+      users.users.musicbox-mixer = {
+        description = "musicbox software mixer";
+        isSystemUser = true;
+        # Primary group, the same way the bluealsa daemon's own user is set up.
+        # It means every file the mixer creates, the control socket included, is
+        # group audio without anyone having to remember to chgrp it.
+        group = "audio";
+      };
+
+      systemd.services.musicbox-mixer = {
+        description = "musicbox software mixer feeding the Bluetooth speaker";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "bluealsa.service" "musicbox-bt-connect.service" ];
+        wants = [ "bluealsa.service" "musicbox-bt-connect.service" ];
+        # An open PCM does not survive a bluealsa restart, exactly as for
+        # snapclient. The mixer catches ALSA errors and reopens on its own, but
+        # a supervisor that already knows the device went away is cheaper and
+        # more predictable than a retry loop discovering it.
+        partOf = [ "bluealsa.service" ];
+
+        # ── The decoders, and why this line is load bearing ────────────────────
+        # The mixer pre-decodes every sound effect to raw PCM at startup by
+        # spawning one of ffmpeg, mpg123 or sox, found with shutil.which(). A
+        # systemd service on this box does NOT inherit the system PATH: the
+        # default is coreutils, findutils, gnugrep, gnused and systemd, and
+        # nothing else (read straight off the running musicbox unit with
+        # `systemctl show musicbox -p Environment`). Without this line
+        # which() returns None three times, every effect fails to decode, the
+        # mixer comes up green with an empty effect list, and every single
+        # press falls back to the Music Assistant announcement path. The mixer
+        # would be doing all of the work and none of the good.
+        #
+        # mkForce is required rather than defensive, for the same reason it is
+        # on musicbox-bt-connect: the systemd module always defines PATH from
+        # the default unit dependencies, so a plain assignment is a conflicting
+        # definition and evaluation fails. It REPLACES the default list, which
+        # is why coreutils is spelled out again here.
+        #
+        # ffmpeg is first in the mixer's own decoder list because it is the
+        # only one of the three that is exact on every input measured: mpg123
+        # emits ZERO BYTES for a wav or an ogg and says nothing about it, and
+        # sox leaves the mp3 decoder delay in. All three are in the binary
+        # cache for aarch64-linux on the pinned nixpkgs (checked: 200 from
+        # cache.nixos.org for each), which matters because this box boots off
+        # an SD card and has wedged itself twice compiling from source.
+        path = lib.mkForce [
+          pkgs.ffmpeg-headless
+          pkgs.mpg123
+          pkgs.sox
+          pkgs.coreutils
+        ];
+
+        environment = {
+          # The mixer process does not read this one: it is running, which
+          # settles the question. It is set so its own start line, and anything
+          # run by hand in this unit's environment (`musicbox-mixer --check`),
+          # does not report "enable=false" from inside the enabled mixer. That
+          # is a small lie of exactly the kind that costs an hour later.
+          MUSICBOX_MIXER = "1";
+          MUSICBOX_MIXER_FIFO = cfg.mixer.fifo;
+          MUSICBOX_MIXER_SOCKET = cfg.mixer.socket;
+          MUSICBOX_MIXER_DEVICE = mixerDevice;
+          MUSICBOX_MIXER_DUCK_DB = toString cfg.mixer.duckDb;
+          MUSICBOX_MIXER_GAIN_DB = toString cfg.mixer.gainDb;
+          MUSICBOX_MIXER_VOICES = toString cfg.mixer.voices;
+
+          # periodMs is the option because milliseconds are what a person
+          # reasons about; frames are what ALSA takes. 48 frames per ms at
+          # 48000 Hz, so 20 ms is 960 frames, which with 10 periods measures out
+          # as exactly the 200 ms ALSA buffer this box already proved is the one
+          # depth that works.
+          MUSICBOX_MIXER_PERIODSIZE = toString (cfg.mixer.periodMs * 48);
+          MUSICBOX_MIXER_PERIODS = toString cfg.mixer.periods;
+          MUSICBOX_MIXER_PIPE_BYTES = toString cfg.mixer.pipeBytes;
+
+          # The mixer chmods its socket to this after bind(). Set explicitly
+          # rather than left to the application default, because it is half of
+          # how musicbox reaches it: 0660 plus group `audio`, which musicbox is
+          # put in when this is enabled. If it ever came out 0600, every effect
+          # would silently fall back to the announcement path over a permission
+          # error nobody reads during an event.
+          MUSICBOX_MIXER_SOCKET_MODE = "0660";
+
+          # The mixer's view of the sfx directory, which is NOT cfg.sfxDir. See
+          # mixerSfxDir in the let block: musicbox's state really lives under
+          # /var/lib/private, which is 0700 root and denies any other user at the
+          # traversal, so the directory is bind mounted somewhere reachable
+          # instead.
+          MUSICBOX_SFX_DIR = mixerSfxDir;
+
+          # Where decoded PCM is cached. The sfx directory itself is mounted read
+          # only and is owned by musicbox's transient uid anyway, so the cache
+          # cannot live beside the mp3s. Offered under two names because a
+          # decode cache is exactly the kind of thing that reaches for
+          # XDG_CACHE_HOME, and the default of that (~/.cache) is a home
+          # directory this user does not have.
+          MUSICBOX_MIXER_CACHE_DIR = "/var/cache/musicbox-mixer";
+          XDG_CACHE_HOME = "/var/cache/musicbox-mixer";
+
+          # alsa-lib resolves `type bluealsa` by dlopening
+          # libasound_module_pcm_bluealsa.so out of $ALSA_PLUGIN_DIR. This is the
+          # same variable snapclient's unit sets and for the same reason, but it
+          # is worth restating because of how it fails: without it the error is
+          # "No such device or address", which reads as "the speaker is not
+          # connected" and sends you to bluetoothctl. The real cause is only
+          # visible in the alsa-lib dlmisc.c line on stderr, which is why this
+          # unit's output has to reach the journal. Measured both ways on this
+          # box: unset gives ENXIO, set gives a D-Bus level error, which is proof
+          # the plugin loaded.
+          ALSA_PLUGIN_DIR = "${pkgs.bluez-alsa}/lib/alsa-lib";
+
+          # Unbuffered, so a traceback and every warn line about a dry FIFO or an
+          # XRUN reach the journal as they happen. This service's whole safety
+          # story is that a fault is loud; a fault sitting in a pipe buffer is
+          # the silent-with-everything-green failure again.
+          PYTHONUNBUFFERED = "1";
+        };
+
+        serviceConfig = {
+          Type = "simple";
+
+          # Creates the FIFO before the mixer, and before snapclient can possibly
+          # reach it. See mixerPrepare in the let block for why a missing FIFO is
+          # worse than a broken one.
+          ExecStartPre = mixerPrepare;
+
+          # Not lib.getExe: mainProgram is musicbox-server. This is the other
+          # console script in the same package.
+          ExecStart = "${mixerPackage}/bin/musicbox-mixer";
+
+          User = "musicbox-mixer";
+          Group = "audio";
+
+          # Belt to the socket mode's braces. The mixer chmods its socket after
+          # bind (MUSICBOX_MIXER_SOCKET_MODE above), so this is not what makes
+          # the socket reachable; it is what makes everything ELSE the process
+          # writes, the decoded PCM cache in particular, group readable and
+          # world closed by default. The FIFO does not depend on it either, since
+          # mkfifo -m applies its mode the way chmod does.
+          UMask = "0007";
+
+          # 0750, not 0755: group audio can traverse, which covers snapclient
+          # reaching the FIFO and musicbox reaching the socket, and nothing else
+          # can. Both files live here so that stopping the unit removes both.
+          #
+          # The mode does one more thing that is worth stating because it is
+          # easy to "tidy" away: group has no WRITE bit, so snapclient cannot
+          # create a file in here. snapcast's file player opens its target with
+          # fopen(..., "wb"), which CREATES a regular file when the path is
+          # missing, and it would then happily write 9600 bytes every 50 ms into
+          # a regular file in a tmpfs with every unit green and the room silent.
+          # With 0750 that open fails with EACCES instead, which is loud.
+          RuntimeDirectory = "musicbox-mixer";
+          RuntimeDirectoryMode = "0750";
+
+          # Keep the directory, and therefore the FIFO inode, across a restart
+          # of THIS unit. Removed on a real stop, as usual.
+          #
+          # Without it, every mixer restart destroys the node snapclient has
+          # open. snapclient does not reopen it and does not check its writes,
+          # so depending on whether it takes the SIGPIPE it either dies (fine,
+          # it comes back) or keeps running while writing into a deleted inode
+          # forever (not fine: unit active, no music, nothing in any log). The
+          # mixer opens the fifo O_RDWR and so is its own writer; the same trick
+          # from the other side is this line, and between them a restart of
+          # either process is a gap in the sound rather than an outage.
+          RuntimeDirectoryPreserve = "restart";
+
+          # /var/cache/musicbox-mixer, for the decoded PCM. Effects are decoded
+          # once at startup and cached, so that triggering one costs a memory
+          # copy and not an ffmpeg spawn: decoding the current 12 file, 862 KB
+          # sfx directory takes well under a second of CPU and about 11 MB.
+          CacheDirectory = "musicbox-mixer";
+
+          # Read only on purpose, and it could not usefully be otherwise: the
+          # directory belongs to musicbox's transient uid, so the mixer could not
+          # write into it even if the mount allowed it. The `-` prefix makes the
+          # mount non-fatal when the source does not exist yet, which is the
+          # state of a box where musicbox has never started. The mixer then finds
+          # an empty sfx directory and says so, which is a better failure than a
+          # unit that refuses to start.
+          BindReadOnlyPaths = [ "-${mixerSfxSource}:${mixerSfxDir}" ];
+
+          # `always`, not `on-failure`, and the same reasoning as snapclient's:
+          # the normal state between boot and the speaker reconnecting is that
+          # there is no A2DP transport to open, and a mixer that gives up then is
+          # a mixer that needs a human on a headless box.
+          Restart = "always";
+          RestartSec = "5s";
+
+          # ── Hardening, kept deliberately thin ────────────────────────────────
+          # snapclient, which does the same job against the same device, runs
+          # with none of this. The failure mode of over-sandboxing here is a
+          # process that starts, reports healthy and produces no sound, which is
+          # the one failure this box must not have. So: the cheap options that
+          # cannot interfere with ALSA or D-Bus, and nothing else.
+          #
+          # Specifically NOT set, each for a reason:
+          #   PrivateDevices  removes /dev/snd. bluez-alsa needs D-Bus rather
+          #                   than a device node, so this would probably be fine,
+          #                   and "probably fine" is not a good enough reason to
+          #                   put a sandbox between this process and its output.
+          #   ProtectSystem=strict  would need the runtime, cache and mount paths
+          #                   listing by hand for no benefit over "full" here.
+          #   RestrictAddressFamilies  the process needs AF_UNIX for both the
+          #                   control socket and the system bus; getting the list
+          #                   wrong reads as bluealsa refusing the connection.
+          #   Nice / RT priority  the mix costs 51 us of a 20000 us budget with
+          #                   four voices, 0.26% of one core. If XRUNs ever show
+          #                   up, a small negative Nice is the first thing to try
+          #                   and a bigger buffer is the last: this box has been
+          #                   burned twice by the second one.
+          NoNewPrivileges = true;
+          ProtectSystem = "full";
+          ProtectHome = true;
+          PrivateTmp = true;
+        };
+
+        # A speaker power cycle produces a burst of failed starts, the same as it
+        # does for snapclient, and systemd's default start limit would then wedge
+        # the unit permanently. A wedged mixer takes snapclient down with it now,
+        # so this matters more here than it does there.
+        unitConfig.StartLimitIntervalSec = 0;
+      };
     })
   ]);
 }

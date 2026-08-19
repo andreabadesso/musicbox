@@ -46,6 +46,13 @@
               uvicorn
               aiohttp
               mcp
+              # O mixer soma as vozes com numpy. pyalsaaudio NAO entra aqui:
+              # ALSA nao existe no macOS e o pacote e marcado como sem suporte,
+              # o que quebrava o `nix develop` inteiro no laptop. Os testes do
+              # mixer nao precisam dele, porque o sink e injetavel e a suite
+              # escreve num buffer. Quem precisa de verdade e o Pi, e la ele
+              # entra por nix/package.nix.
+              numpy
               # Dev-only, not runtime deps: httpx drives fastapi's TestClient
               # and pytest runs the suite. Keeping them out of nix/package.nix
               # keeps them out of the Pi's closure.
