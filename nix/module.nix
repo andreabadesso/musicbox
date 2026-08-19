@@ -1466,9 +1466,18 @@ in
           # Pin the FIFO's format so a change in what MA's snapserver produces
           # fails in snapclient's resampler instead of silently reinterpreting
           # headerless PCM at the wrong rate downstream. See mixer.sampleFormat.
+          # O campo de canais vai como `*`, e nao como o numero.
+          #
+          # snapclient recusa `48000:16:2` com
+          #   [Fatal] Exception: sampleformat channels must be * (= same as the source)
+          # e sai com status 1, num laco de restart. Ele aceita fixar taxa e
+          # profundidade, mas exige que o numero de canais acompanhe a fonte.
+          # Como o mixer so entende 2 canais, o que protege de verdade e a
+          # checagem que ele faz ao abrir o dispositivo, nao este argumento.
+          # Descoberto ligando o mixer pela primeira vez, em 2026-08-19.
           ++ lib.optionals (cfg.mixer.enable && cfg.mixer.sampleFormat != "") [
             "--sampleformat"
-            cfg.mixer.sampleFormat
+            (builtins.replaceStrings [ ":2" ] [ ":*" ] cfg.mixer.sampleFormat)
           ]
           ++ [
             # Mandatory with bluez-alsa. The hardware mixer path goes through
