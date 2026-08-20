@@ -218,9 +218,13 @@ async function loadSfxGain() {
   try {
     const r = await fetch('/mixer/gain');
     const d = await r.json();
-    if (d.ok && typeof d.gain_db === 'number') {
-      sfxvol.value = d.gain_db;
-      sfxval.textContent = d.gain_db + ' dB';
+    // Number() e nao typeof: o servidor ja converte, mas confiar em tipo
+    // exato vindo de JSON foi exatamente o que escreveu "sem mixer" na tela
+    // com o mixer no ar.
+    const db = d.ok ? Number(d.gain_db) : NaN;
+    if (Number.isFinite(db)) {
+      sfxvol.value = db;
+      sfxval.textContent = db + ' dB';
     } else {
       // Mixer desligado: o controle nao tem o que controlar.
       sfxvol.disabled = true;

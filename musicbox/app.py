@@ -1217,6 +1217,20 @@ async def localize_media(media: str) -> dict[str, Any]:
     }
 
 
+def _gain_as_number(value: Any) -> float | None:
+    """O protocolo do mixer e texto, entao gain_db chega como "-3.000".
+
+    Sem esta conversao a rota devolvia uma string num campo numerico, a pagina
+    checava `typeof === "number"`, dava falso, e desenhava "sem mixer" com o
+    mixer rodando perfeitamente. Errado de um jeito que parece falha de
+    infraestrutura e e so tipo.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 async def perform_media(
     ma: MAClient,
     wanted: str,
@@ -1930,7 +1944,7 @@ def create_app(config: Config | None = None, ma: MAClient | None = None) -> Fast
             return {"ok": False, "error": "mixer_disabled", "detail": "O mixer nao esta ligado neste host."}
         try:
             answer = await client.gain()
-            return {"ok": True, "gain_db": answer.get("gain_db")}
+            return {"ok": True, "gain_db": _gain_as_number(answer.get("gain_db"))}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": "mixer_unavailable", "detail": f"{type(exc).__name__}: {exc}"}
 
@@ -1950,7 +1964,7 @@ def create_app(config: Config | None = None, ma: MAClient | None = None) -> Fast
             raise HTTPException(status_code=503, detail=f"{type(exc).__name__}: {exc}") from None
         if answer.get("status") == "err":
             raise HTTPException(status_code=400, detail=answer.get("message") or "recusado pelo mixer")
-        return {"ok": True, "gain_db": answer.get("gain_db")}
+        return {"ok": True, "gain_db": _gain_as_number(answer.get("gain_db"))}
 
     @open_router.get("/board", response_class=HTMLResponse)
     async def board():

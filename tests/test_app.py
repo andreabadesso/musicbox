@@ -1577,3 +1577,20 @@ def test_the_soundboard_page_serves_without_a_token(tmp_path):
         assert "/sfx/" in page.text
         # E o resto da API continua fechado.
         assert client.get("/now").status_code == 401
+
+
+def test_the_gain_route_answers_with_a_number_not_a_string(tmp_path):
+    """O protocolo do mixer e texto e devolve gain_db como "-3.000".
+
+    Devolver isso cru num campo numerico fez a pagina escrever "sem mixer" na
+    tela com o mixer rodando, porque ela checava o tipo. Errado de um jeito que
+    parece falha de infraestrutura e e so conversao.
+    """
+    from musicbox.app import _gain_as_number
+
+    assert _gain_as_number("-3.000") == -3.0
+    assert _gain_as_number(-3.0) == -3.0
+    assert _gain_as_number("0") == 0.0
+    # Lixo vira None, e a rota responde "sem mixer" com razao.
+    assert _gain_as_number(None) is None
+    assert _gain_as_number("alto") is None
