@@ -984,10 +984,35 @@ def register_tools(mcp: FastMCP, backend: Any) -> None:
     # exists to keep away from the model. Widened, every one of those reaches
     # the body and gets a sentence. int stays first so the schema still leads
     # with the type a client should send.
+    # `volume` como apelido de `level`, e nao um nome so.
+    #
+    # Um agente em producao chamou set_volume({"volume": 100}) e levou
+    #   1 validation error for set_volumeArguments - level Field required
+    # que e um erro sem saida: o modelo mandou o nome obvio para a acao e o
+    # servidor recusou por causa do rotulo. Discutir qual nome e o certo custa
+    # mais do que aceitar os dois, e "volume" e o palpite que qualquer um da
+    # para uma ferramenta chamada set_volume.
+    #
+    # `level` continua primeiro na assinatura, entao e ele que aparece no
+    # schema e continua sendo o nome canonico para quem le a doc.
     @mcp.tool()
-    async def set_volume(level: int | float | str) -> str:
-        """Set the speaker volume, 0 to 100. Send a whole number."""
+    async def set_volume(
+        level: int | float | str | None = None,
+        volume: int | float | str | None = None,
+    ) -> str:
+        """Set the speaker volume, 0 to 100. Send a whole number.
+
+        The number goes in `level`. `volume` is accepted as an alias for the
+        same thing, so either name works.
+        """
         try:
+            if level is None:
+                level = volume
+            if level is None:
+                raise ToolFailure(
+                    "Nothing to set: send the number as `level` (or `volume`), "
+                    "from 0 to 100. The volume was not changed."
+                )
             try:
                 # round(float(...)) and not int(...): int("55.7") is a
                 # ValueError, and refusing a perfectly clear request for 55.7

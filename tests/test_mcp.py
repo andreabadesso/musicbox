@@ -1064,3 +1064,22 @@ async def test_the_lane_is_shared_by_the_http_routes_and_the_mounted_tools(tmp_p
         finally:
             await backend.close()
     assert ids_of(stub)[6:8] == ["added1", "added2"]
+
+
+@async_test()
+async def test_set_volume_accepts_volume_as_an_alias_for_level(tmp_path: Path):
+    """Um agente real chamou set_volume({"volume": 100}) e levou
+
+        1 validation error for set_volumeArguments - level Field required
+
+    que e um beco sem saida: o modelo mandou o nome obvio para a acao e o
+    servidor recusou pelo rotulo. Os dois nomes valem agora.
+    """
+    mcp, stub = build_mcp_for(tmp_path)
+    assert "55" in await call(mcp, "set_volume", level=55)
+    assert "70" in await call(mcp, "set_volume", volume=70)
+    assert ("set_volume", 55) in stub.calls
+    assert ("set_volume", 70) in stub.calls
+    # Sem nenhum dos dois: frase, nao stack trace.
+    said = await call(mcp, "set_volume")
+    assert "level" in said and "volume" in said
