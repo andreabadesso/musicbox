@@ -68,8 +68,10 @@ BOARD_HTML = """<!doctype html>
   <button onclick="cmd('pause')">pause</button>
   <button onclick="cmd('resume')">resume</button>
   <button onclick="cmd('skip')">skip</button>
-  <label>volume <input id="vol" type="range" min="0" max="100" value="45"></label>
+  <label>música <input id="vol" type="range" min="0" max="100" value="45"></label>
   <span id="volval">45</span>
+  <label>efeitos <input id="sfxvol" type="range" min="-30" max="12" step="1" value="-3"></label>
+  <span id="sfxval">-3 dB</span>
 </div>
 
 <div id="msg"></div>
@@ -186,6 +188,47 @@ document.addEventListener('keydown', ev => {
   fire(names[idx], el);
 });
 
+// ── Volume dos efeitos ────────────────────────────────────────────────────
+// Em dB, e nao numa escala de 0 a 100, porque e isso que o mixer entende e
+// traduzir aqui so criaria um numero que nao bate com o log nem com o nix.
+// A faixa vai ate +12: os arquivos vem de bibliotecas de meme e alguns foram
+// gravados baixo demais, entao ficar preso em 0 deixaria esses inaudiveis. O
+// mixer satura de forma limpa, entao o pior caso de exagerar e distorcer, nao
+// estourar em wraparound.
+//
+// O valor NAO fica salvo: e o ajuste da noite. Se um numero se provar bom, ele
+// vira o default no nix, e ai sobrevive a reboot.
+const sfxvol = document.getElementById('sfxvol');
+const sfxval = document.getElementById('sfxval');
+
+sfxvol.addEventListener('input', () => sfxval.textContent = sfxvol.value + ' dB');
+sfxvol.addEventListener('change', async () => {
+  try {
+    const r = await fetch('/mixer/gain', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({db: Number(sfxvol.value)})
+    });
+    const d = await r.json();
+    say(d.ok ? ('efeitos em ' + d.gain_db + ' dB') : ('efeitos: ' + (d.detail || 'falhou')), !d.ok);
+  } catch (e) { say('efeitos: ' + e, true); }
+});
+
+async function loadSfxGain() {
+  try {
+    const r = await fetch('/mixer/gain');
+    const d = await r.json();
+    if (d.ok && typeof d.gain_db === 'number') {
+      sfxvol.value = d.gain_db;
+      sfxval.textContent = d.gain_db + ' dB';
+    } else {
+      // Mixer desligado: o controle nao tem o que controlar.
+      sfxvol.disabled = true;
+      sfxval.textContent = 'sem mixer';
+    }
+  } catch (e) { sfxvol.disabled = true; sfxval.textContent = 'sem mixer'; }
+}
+
 const vol = document.getElementById('vol');
 const volval = document.getElementById('volval');
 vol.addEventListener('input', () => volval.textContent = vol.value);
@@ -206,6 +249,7 @@ async function refresh() {
 }
 
 loadSfx();
+loadSfxGain();
 refresh();
 setInterval(refresh, 5000);
 </script>

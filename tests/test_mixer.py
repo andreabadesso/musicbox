@@ -1287,3 +1287,24 @@ def test_cut_mode_never_uses_the_mixer(tmp_path: Path, socket_path: Path):
         assert _announcements(ma) == 1
     finally:
         service.close()
+
+
+def test_the_gain_command_reads_and_sets_without_restarting(tmp_path: Path):
+    """O ganho tem que ser ajustavel ao vivo.
+
+    Calibrar por variavel de ambiente e um ciclo horrivel: editar o nix,
+    deployar, ouvir, repetir, e cada volta reinicia o mixer e corta o audio.
+    Numa sala real o volume certo se acha girando um botao e escutando.
+    """
+    service = service_for(tmp_path)
+
+    # Sem argumento le, para a pagina desenhar o controle onde ele esta.
+    assert service.handle("gain").startswith("ok gain")
+
+    assert "gain_db=-9" in service.handle("gain -9")
+    assert "gain_db=-9" in service.handle("gain")
+
+    # Recusa o que contamina o acumulador ou nao faz sentido, e o valor bom fica.
+    for bad in ("gain nan", "gain inf", "gain 999", "gain -999", "gain alto"):
+        assert service.handle(bad).startswith("err bad_gain"), bad
+    assert "gain_db=-9" in service.handle("gain")

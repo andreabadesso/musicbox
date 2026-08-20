@@ -1065,6 +1065,9 @@ class Mixer:
         self.duck_db = float(duck_db)
         self.duck_floor = db_to_gain(duck_db)
         self.effect_gain = db_to_gain(effect_db)
+        # O valor em dB fica guardado tambem, e nao so o fator linear, porque o
+        # controle e a pagina falam em dB e precisam saber onde o botao esta.
+        self.effect_db = float(effect_db)
         self.fade_in_ms = float(fade_in_ms)
         self.fade_out_ms = float(fade_out_ms)
         # Per-frame steps for the duck envelope. The full travel is
@@ -1525,7 +1528,7 @@ class MixerService:
         except ValueError as exc:
             return encode(ERR, "bad_syntax", message=str(exc))
         if not parts:
-            return encode(ERR, "empty", message="say one of: ping play stop list stats reload")
+            return encode(ERR, "empty", message="say one of: ping play stop list stats reload gain")
         command, args = parts[0].lower(), parts[1:]
         handler = getattr(self, f"_cmd_{command}", None)
         if handler is None:
@@ -1578,6 +1581,32 @@ class MixerService:
             gain_db=gain_db,
             voices=self.engine.mixer.voices,
         )
+
+    def _cmd_gain(self, args: list[str]) -> str:
+        """Le ou ajusta o ganho base dos efeitos, em dB, sem reiniciar nada.
+
+        Existe porque calibrar isso por variavel de ambiente e um ciclo horrivel:
+        editar o nix, deployar, ouvir, repetir, e cada volta reinicia o mixer e
+        corta o audio. Numa sala real o volume certo se acha em segundos, girando
+        um botao e escutando, e e isso que a pagina /board faz agora.
+
+        Sem argumento devolve o valor atual, entao a pagina consegue desenhar o
+        controle na posicao certa ao abrir.
+        """
+        if not args:
+            return encode(OK, "gain", gain_db=round(self.engine.mixer.effect_db, 2))
+        try:
+            value = float(args[0])
+        except ValueError:
+            return encode(ERR, "bad_gain", value=args[0], message="gain <db>, um numero entre -60 e 20")
+        # Mesma faixa e mesma recusa de NaN do gain= por disparo: um NaN
+        # contamina o acumulador inteiro e sai como ruido de fundo de escala.
+        if not math.isfinite(value) or not -60.0 <= value <= 20.0:
+            return encode(ERR, "bad_gain", value=args[0], message="gain must be a finite number of dB between -60 and 20")
+        self.engine.mixer.effect_db = value
+        self.engine.mixer.effect_gain = db_to_gain(value)
+        logs.log("mixer_gain_set", gain_db=value)
+        return encode(OK, "gain", gain_db=round(value, 2))
 
     def _cmd_stop(self, args: list[str]) -> str:
         self.engine.submit_stop()

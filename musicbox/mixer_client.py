@@ -182,3 +182,7 @@ class MixerClient:
 
     async def reload(self) -> dict[str, Any]:
         return await self.command("reload")
+
+    async def gain(self, db: float | None = None) -> dict[str, Any]:
+        """Le (sem argumento) ou ajusta o ganho base dos efeitos, em dB."""
+        return await self.command("gain" if db is None else f"gain {db}")

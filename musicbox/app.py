@@ -1913,6 +1913,45 @@ def create_app(config: Config | None = None, ma: MAClient | None = None) -> Fast
     #
     # Sem cache: a lista de sons muda quando alguem copia um arquivo novo, e
     # uma pagina cacheada mostraria um teclado desatualizado.
+    # Ganho dos efeitos, lido e ajustado em tempo real.
+    #
+    # Aberto como o resto das rotas da pagina: quem abre o /board precisa poder
+    # mexer no controle sem carregar um token no navegador do celular.
+    #
+    # O valor NAO e persistido de proposito. O que fica no nix e o valor com que
+    # o mixer sobe; isto aqui e o ajuste da noite, feito de ouvido, e some num
+    # restart. Se um numero se provar bom, ele vira o default no config, e ai
+    # sobrevive. Persistir os dois lugares seria ter duas fontes de verdade
+    # discordando na primeira vez que alguem editasse o nix.
+    @open_router.get("/mixer/gain")
+    async def mixer_gain_get() -> dict[str, Any]:
+        client = get_mixer()
+        if client is None:
+            return {"ok": False, "error": "mixer_disabled", "detail": "O mixer nao esta ligado neste host."}
+        try:
+            answer = await client.gain()
+            return {"ok": True, "gain_db": answer.get("gain_db")}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": "mixer_unavailable", "detail": f"{type(exc).__name__}: {exc}"}
+
+    @open_router.post("/mixer/gain")
+    async def mixer_gain_set(body: dict[str, Any]) -> dict[str, Any]:
+        client = get_mixer()
+        if client is None:
+            raise HTTPException(status_code=503, detail="O mixer nao esta ligado neste host.")
+        raw = body.get("db", body.get("gain_db"))
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"db precisa ser um numero em dB, recebi {raw!r}.") from None
+        try:
+            answer = await client.gain(value)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=503, detail=f"{type(exc).__name__}: {exc}") from None
+        if answer.get("status") == "err":
+            raise HTTPException(status_code=400, detail=answer.get("message") or "recusado pelo mixer")
+        return {"ok": True, "gain_db": answer.get("gain_db")}
+
     @open_router.get("/board", response_class=HTMLResponse)
     async def board():
         return HTMLResponse(BOARD_HTML, headers={"cache-control": "no-store"})
