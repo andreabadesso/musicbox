@@ -104,6 +104,7 @@ async def test_every_promised_tool_is_registered(tmp_path):
         "get_queue",
         "drop",
         "sfx",
+        "say",
         "list_sfx",
         "now_playing",
         "skip",

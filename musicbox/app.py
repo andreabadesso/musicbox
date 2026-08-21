@@ -32,6 +32,7 @@ from .config import Config
 # socket and a shlex parser and nothing else.
 from .mixer_client import MixerClient, MixerUnavailable
 from .prefetch import PrefetchError, Prefetcher
+from .tts import TTS, TTSError, is_say_file
 from .ma_client import (
     BUFFERED_DETAIL,
     ERR_INSUFFICIENT_PERMISSIONS,
@@ -77,6 +78,20 @@ MIXER_NOTE = (
     "Played through musicbox-mixer: the effect is layered on top of the music "
     "and the music ducks under it instead of stopping. Pressing again while it "
     "plays adds another copy rather than waiting in line."
+)
+
+
+# The two halves of what say() sounds like, kept separate for the same reason
+# OVER_NOTE and MIXER_NOTE are: a caller reading the answer has to be able to
+# tell the two apart without knowing this feature exists.
+SAY_MIXER_NOTE = (
+    "Spoken through musicbox-mixer: the voice is layered over the music and the "
+    "music ducks under it. The song kept playing."
+)
+SAY_ANNOUNCEMENT_NOTE = (
+    "Spoken through a Music Assistant announcement, which is the fallback: the "
+    "music was SILENCED for the length of the sentence and rejoined the track "
+    "wherever it got to."
 )
 
 
@@ -132,6 +147,16 @@ class DropBody(BaseModel):
     mode: str = "over"
 
 
+class SayBody(BaseModel):
+    text: str = Field(description="What to say out loud, in Brazilian Portuguese.")
+    gain_db: float | None = Field(
+        default=None,
+        description="Volume of the voice relative to the effect gain, in dB. "
+        "Only the mixer path honours it; an announcement plays at the player's "
+        "own volume.",
+    )
+
+
 class SfxBody(BaseModel):
     """Body for POST /sfx/{name}.
 
@@ -180,6 +205,12 @@ def list_sfx(sfx_dir: Path) -> list[dict[str, Any]]:
     out = []
     for path in entries:
         if path.suffix.lower() not in SFX_EXTENSIONS:
+            continue
+        # Rendered speech shares this directory, because it is the only
+        # directory musicbox-mixer scans and the only one /sfx/file serves.
+        # See musicbox/tts.py. Hidden here so the soundboard shows the sounds
+        # an operator put on the box and not `say-3f8c9d...` forty times.
+        if is_say_file(path):
             continue
         try:
             size = path.stat().st_size
@@ -1178,6 +1209,22 @@ def get_mixer() -> MixerClient | None:
     return _MIXER
 
 
+# E o mesmo padrao do mixer e do prefetcher, pelo mesmo motivo: perform_say e
+# chamado pela rota HTTP e pelo backend MCP, e nenhum dos dois carrega o
+# Config. None quando o create_app nao montou nenhum, que e o caso dos testes
+# que nao falam de voz.
+_TTS: TTS | None = None
+
+
+def set_tts(tts: TTS | None) -> None:
+    global _TTS
+    _TTS = tts
+
+
+def get_tts() -> TTS | None:
+    return _TTS
+
+
 async def localize_media(media: str) -> dict[str, Any]:
     """Troca uma URL remota pela copia local, baixando se preciso.
 
@@ -1675,6 +1722,164 @@ async def perform_sfx(
     return result
 
 
+async def perform_say(
+    ma: MAClient,
+    tts: TTS | None,
+    text: str,
+    base_url: str,
+    mixer: MixerClient | None = None,
+    gain_db: float | None = None,
+) -> dict[str, Any]:
+    """Speak a sentence to the room, by the best path available.
+
+    Exactly the shape perform_sfx has, and deliberately so: same two paths,
+    same `path` field in the answer naming which one ran, same rule that a
+    mixer failure falls through to the announcement path rather than failing
+    the call. The only difference is that the audio is rendered first.
+
+    THIS NEVER RAISES for a configuration problem, an empty string or a wall of
+    text. It answers `ok: false` with a full sentence, because the two callers
+    are a model mid-event and a text box on a phone, and neither of them can do
+    anything with a traceback. A box with no piper installed is a normal box:
+    see TTS.unavailable_reason and the tts_available field on /health.
+
+    gain_db is passed to the mixer only. The announcement path has no volume
+    control of its own (MA plays an announcement at the player's volume) and
+    silently ignoring it there is better than refusing to speak.
+    """
+    # Checked here and not left to the mixer, because the mixer rejects a bad
+    # gain with `err bad_gain`, MixerClient turns every err into the same
+    # MixerUnavailable, and perform_say cannot tell that apart from a dead
+    # socket. The result would be that a typo in gain_db silently took the
+    # announcement path and STOPPED THE MUSIC. Same range the mixer enforces.
+    if gain_db is not None and not (-60.0 <= gain_db <= 20.0):
+        return {
+            "ok": False,
+            "spoken": False,
+            "error": "bad_gain",
+            "detail": (
+                f"gain_db must be between -60 and 20 dB, and {gain_db} is not, so "
+                "nothing was spoken. The music was not interrupted."
+            ),
+        }
+    if tts is None:
+        return {
+            "ok": False,
+            "spoken": False,
+            "error": "tts_unavailable",
+            "detail": (
+                "Text to speech is not set up on this box, so nothing was spoken. "
+                "The music was not interrupted."
+            ),
+        }
+    try:
+        rendered = await tts.render(text)
+    except TTSError as exc:
+        # Every raise site in tts.py writes a full sentence ending in what did
+        # not happen. Passing it through unchanged is the whole design.
+        return {
+            "ok": False,
+            "spoken": False,
+            "error": "tts_failed",
+            "detail": str(exc),
+            "voice": tts.voice_name,
+        }
+
+    name = rendered.path.stem
+    url = sfx_file_url(base_url, rendered.path.name)
+    common = {
+        "ok": True,
+        "spoken": True,
+        "text": tts.clean(text),
+        "voice": tts.voice_name,
+        "cached": rendered.cached,
+        # `is not None` and not a truth test. A duration of 0.0 is falsy, and
+        # reporting a silent clip as "seconds": null reads like a clip whose
+        # length could not be measured rather than one with no audio in it.
+        # tts.render refuses those outright now, so this is belt and braces on
+        # the one field a reader uses to sanity check what the room heard.
+        "seconds": round(rendered.duration, 2) if rendered.duration is not None else None,
+        "url": url,
+    }
+
+    if mixer is not None and mixer.enabled:
+        try:
+            answer = await _say_through_mixer(mixer, name, rendered.cached, gain_db)
+        except MixerUnavailable as exc:
+            # warn and not error: the fallback works and the sentence still
+            # gets said. This is the line to grep for when speech suddenly
+            # starts cutting the music again.
+            logs.warn("say_mixer_unavailable", clip=name, error=str(exc))
+        else:
+            return {
+                **common,
+                "path": "mixer",
+                "fell_back": False,
+                "voices": _int_or_none(answer.get("voices")),
+                "note": SAY_MIXER_NOTE,
+            }
+        # `{**common, **result}` and not `result.update(common)`, which is the
+        # same fields in the other order and quietly a lie. common carries
+        # ok: True and spoken: True, written before either path had run, so
+        # updating with it OVERWRITES whatever perform_drop said about how the
+        # announcement actually went. Today perform_drop only ever returns
+        # ok: True (it raises otherwise, into the MAError handler), so this is
+        # a trap set for the next person who makes it return a failure instead:
+        # say() would answer "spoken: true" for a sentence the room never
+        # heard. The two fields perform_drop cannot know about are set after.
+        result = {**common, **await perform_drop(ma, url, "over")}
+        result["path"] = "announcement"
+        result["fell_back"] = True
+        result["note"] = SAY_ANNOUNCEMENT_NOTE
+        result["reason"] = "the mixer was not usable, spoke through Music Assistant instead"
+        return result
+
+    # Same ordering rule as the fallback above, and the same reason.
+    result = {**common, **await perform_drop(ma, url, "over")}
+    result["path"] = "announcement"
+    result["note"] = SAY_ANNOUNCEMENT_NOTE
+    return result
+
+
+async def _say_through_mixer(
+    mixer: MixerClient, name: str, cached: bool, gain_db: float | None
+) -> dict[str, Any]:
+    """Trigger a rendered clip as a mixer voice, reloading only when needed.
+
+    The mixer plays by NAME out of an in-memory cache it built by scanning the
+    sfx directory, so a clip it has never seen answers `err not_found` however
+    real the file is. `reload` is what makes it look again, and it is not free:
+    it re-stats every effect on the box and re-reads the decoded PCM (about
+    11 MB today) on the control thread. So it is issued in exactly the two
+    cases that need it.
+
+      1. A freshly rendered clip. The mixer provably cannot know it yet.
+      2. A cache hit the mixer answers not_found for, which means the mixer
+         restarted since we last spoke this sentence. Reload and try once more,
+         rather than falling back to the announcement path for a file that is
+         sitting right there.
+
+    A repeated sentence on a running mixer therefore costs one socket round
+    trip, which is the case that happens all evening.
+    """
+    if not cached:
+        await mixer.reload()
+        return await mixer.play(name, gain_db=gain_db)
+    try:
+        return await mixer.play(name, gain_db=gain_db)
+    except MixerUnavailable as exc:
+        # Matching on the text and not on a code because MixerClient.command
+        # collapses every failure into one exception type carrying the raw
+        # reply line ("err not_found name=say-3f8c known=airhorn,fogo"). A
+        # socket that is simply down says "could not reach the mixer", so this
+        # test does not turn a dead mixer into a second two second timeout on
+        # top of the first.
+        if "not_found" not in str(exc):
+            raise
+        await mixer.reload()
+        return await mixer.play(name, gain_db=gain_db)
+
+
 def _int_or_none(value: Any) -> int | None:
     try:
         return int(value)
@@ -1722,6 +1927,12 @@ def create_app(config: Config | None = None, ma: MAClient | None = None) -> Fast
     # there is no client, perform_sfx never looks at a socket, and every sfx
     # takes the same announcement path it took yesterday.
     set_mixer(MixerClient(config.mixer) if config.mixer.enable else None)
+
+    # Always built, unlike the mixer client. TTS has no enable flag: whether it
+    # works is decided by whether MUSICBOX_PIPER_BIN and MUSICBOX_PIPER_VOICE
+    # point at real files, and TTS answers that question at call time so a box
+    # that gains a voice on rebuild starts speaking without a restart.
+    set_tts(TTS(config))
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -1891,6 +2102,14 @@ def create_app(config: Config | None = None, ma: MAClient | None = None) -> Fast
             "mixer_enabled": config.mixer.enable,
             "mixer_ok": mixer.last_ok if mixer else None,
             "mixer_error": mixer.last_error if mixer else None,
+            # tts_available false with a tts_reason sentence is a NORMAL answer,
+            # not an alarm. Speech is the one feature on this box that can be
+            # entirely absent while everything else is green, and the whole
+            # point of reporting it here is that "the box said nothing and
+            # every service is healthy" is the failure this box is worst at.
+            **(get_tts().status() if get_tts() else {"tts_available": False,
+                                                     "tts_reason": "no TTS on this app instance",
+                                                     "tts_voice": None}),
         }
 
     @open_router.get("/sfx/file/{name}")
@@ -2067,6 +2286,26 @@ def create_app(config: Config | None = None, ma: MAClient | None = None) -> Fast
         )
         result["sfx"] = path.stem
         return result
+
+    # ── falar ─────────────────────────────────────────────────────────────────
+    # Autenticada como o resto de /api. E a rota que o /board chama e a que o
+    # MCP chama por dentro, e as duas passam por perform_say para que nao possam
+    # discordar sobre qual caminho essa caixa usa.
+    #
+    # NUNCA 500 e nunca 503. Quem chama aqui e uma pessoa com o dedo num campo
+    # de texto no meio de um evento, e uma pagina de erro nesse momento e mais
+    # uma coisa para depurar. `ok: false` com uma frase e a resposta, exatamente
+    # como em GET /mixer.
+    @api.post("/say")
+    async def say(body: SayBody, request: Request) -> dict[str, Any]:
+        return await perform_say(
+            ma,
+            get_tts(),
+            body.text,
+            sfx_base_url(request),
+            get_mixer(),
+            body.gain_db,
+        )
 
     # ── mixer ─────────────────────────────────────────────────────────────────
     # Never raises and never 503s. This is the endpoint someone hits at an

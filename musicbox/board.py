@@ -51,6 +51,16 @@ BOARD_HTML = """<!doctype html>
   }
   .controls button:hover { background: #1d212a; }
   input[type=range] { width: 160px; }
+  /* Cresce para ocupar a linha, mas com um minimo: num celular o campo e o
+     controle mais usado da pagina depois dos pads, e um input espremido entre
+     dois sliders e um campo que ninguem consegue digitar. */
+  #saytext {
+    flex: 1 1 220px; min-width: 160px;
+    background: #0e0f13; color: #e8e8ea; border: 1px solid #262a33;
+    border-radius: 10px; padding: 9px 12px; font-size: 14px; font-family: inherit;
+  }
+  #saytext:focus { outline: none; border-color: #4a90d9; }
+  #saytext:disabled { color: #5f6570; }
   #msg { margin-top: 12px; font-size: 13px; color: #9aa0a6; min-height: 18px; }
   #msg.err { color: #f28b82; }
   footer { margin-top: 18px; color: #5f6570; font-size: 12px; }
@@ -74,8 +84,14 @@ BOARD_HTML = """<!doctype html>
   <span id="sfxval">-3 dB</span>
 </div>
 
+<div class="controls">
+  <input id="saytext" type="text" maxlength="400" autocomplete="off"
+         placeholder="falar na sala: faltam 30 minutos">
+  <button id="saybtn" onclick="speak()">falar</button>
+</div>
+
 <div id="msg"></div>
-<footer>teclas 1 a 9 e 0 disparam os dez primeiros sons. o modo e "over": a musica silencia durante o efeito e volta de onde parou.</footer>
+<footer>teclas 1 a 9 e 0 disparam os dez primeiros sons. o campo de texto fala na sala por cima da musica. o modo dos sons e "over": a musica silencia durante o efeito e volta de onde parou.</footer>
 
 <script>
 const grid = document.getElementById('grid');
@@ -176,6 +192,63 @@ async function cmd(path, body) {
   } catch (e) { say(path + ': ' + e, true); }
 }
 
+// ── Falar ─────────────────────────────────────────────────────────────────
+// A funcao se chama speak e nao say porque say() ja e a linha de status ali em
+// cima. Duas coisas com o mesmo nome num arquivo de uma pagina so e como a
+// mensagem de erro vira "say is not a function" no meio de um evento.
+//
+// Enter envia, e por isso o handler de teclas la embaixo ignora input: sem
+// isso, digitar "1" no campo dispararia o airhorn.
+const saytext = document.getElementById('saytext');
+const saybtn = document.getElementById('saybtn');
+
+async function speak() {
+  const text = saytext.value.trim();
+  if (!text) { say('escreva alguma coisa para falar', true); saytext.focus(); return; }
+  saybtn.disabled = true;
+  say('falando...');
+  try {
+    const r = await fetch('/say', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text: text})
+    });
+    const d = await r.json();
+    if (d.ok) {
+      // Diz por qual caminho saiu, porque os dois SOAM diferente e quem esta
+      // com a caixa na frente precisa saber se a musica parou de proposito.
+      const via = d.path === 'mixer' ? 'por cima da musica' : 'via anuncio, a musica parou';
+      say('falou (' + via + ')');
+      saytext.value = '';
+    } else {
+      say(d.detail || d.error || 'nao falou', true);
+    }
+  } catch (e) { say('falar: ' + e, true); }
+  finally { saybtn.disabled = false; saytext.focus(); }
+}
+
+saytext.addEventListener('keydown', ev => {
+  if (ev.key === 'Enter') { ev.preventDefault(); speak(); }
+});
+
+// O campo fica desligado quando a caixa nao tem voz configurada, que e um
+// estado normal e nao um erro. Sem isso a pessoa digita, aperta enter e recebe
+// uma frase explicando, o que funciona mas so depois de ela ter escrito.
+async function loadSay() {
+  try {
+    const r = await fetch('/health');
+    const d = await r.json();
+    if (!d.tts_available) {
+      saytext.disabled = true;
+      saybtn.disabled = true;
+      saytext.placeholder = 'sem voz nesta caixa';
+      saytext.title = d.tts_reason || '';
+    } else {
+      saytext.placeholder = 'falar na sala (' + (d.tts_voice || 'voz') + ')';
+    }
+  } catch (e) { /* /health fora do ar ja aparece em outro lugar da pagina */ }
+}
+
 document.addEventListener('keydown', ev => {
   // Ignora quando o foco esta num campo, senao digitar em qualquer lugar
   // dispara som. O slider de volume conta como campo.
@@ -254,6 +327,7 @@ async function refresh() {
 
 loadSfx();
 loadSfxGain();
+loadSay();
 refresh();
 setInterval(refresh, 5000);
 </script>

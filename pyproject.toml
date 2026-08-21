@@ -25,6 +25,14 @@ dependencies = [
   # the same decorator in the closure.
   "mcp",
 ]
+# NOT listed and deliberately: piper. Speech is rendered by running the piper
+# EXECUTABLE, whose path arrives in MUSICBOX_PIPER_BIN, and the voice model is
+# a file in MUSICBOX_PIPER_VOICE. piper-tts as a Python dependency would drag
+# onnxruntime into this environment, and on aarch64 that is a source build on
+# a box that has wedged itself compiling twice. The nix side pins the binary
+# and the voice from an input that resolves in the binary cache. ffmpeg is the
+# same kind of dependency and is already required by the mixer, which is what
+# brings the rendered wav to 48000:16:2.
 
 [project.optional-dependencies]
 # numpy is in the TEST set as well as in mixer, and not marked optional in the

@@ -308,7 +308,7 @@ class Config:
     backoff_initial: float = 1.0
     backoff_max: float = 30.0
 
-    # ── musicbox-mixer ────────────────────────────────────────────────────────
+    # ── musicbox-mixer ────────────────────────────────────────────
     # Nested rather than flattened into a dozen more top level fields, because
     # only three of them (enable, socket, timeout) are any of this process's
     # business; the rest belong to the mixer process and are here so that both
@@ -316,9 +316,49 @@ class Config:
     # enable=False, so a Config built by hand in a test is a box with no mixer.
     mixer: MixerConfig = field(default_factory=MixerConfig)
 
+    # ── speech ─────────────────────────────────────────────────────
+
+    # Absolute path to the piper executable. EMPTY MEANS TTS IS OFF, and that
+    # is a supported state: /health reports tts_available false and say()
+    # answers with a sentence explaining it rather than failing. There is no
+    # default of "piper" on PATH on purpose. This service runs with a systemd
+    # PATH it does not control, and a say() that works on the developer's Mac
+    # and silently does not on the box is exactly the failure this feature
+    # cannot afford.
+    piper_bin: str = ""
+
+    # Path to the .onnx voice model. piper expects its .json config to sit
+    # beside it under the same name plus .json (the nix side pins both as a
+    # fetch, so nothing is downloaded at speech time).
+    piper_voice: str = ""
+
+    # Rendered wavs, keyed by hash of text and voice. None means sfx_dir, and
+    # sfx_dir is the right answer on every real box: musicbox-mixer only plays
+    # what its EffectCache scanned out of MUSICBOX_SFX_DIR, and GET
+    # /sfx/file/<name> only serves what is in there either, so a clip anywhere
+    # else can be played by neither path. Overridable only because a test wants
+    # its own directory. Speech files are named say-<hash>.wav and hidden from
+    # the sfx listing; see musicbox/tts.py.
+    tts_cache_dir: Path | None = None
+
+    def __post_init__(self) -> None:
+        # Accept strings for the path fields. Config is constructed by hand in
+        # tests and by anything embedding this package, and a str that silently
+        # behaves like a Path everywhere except `.iterdir()` is a trap worth
+        # closing here rather than at every use site.
+        if not isinstance(self.sfx_dir, Path):
+            self.sfx_dir = Path(self.sfx_dir)
+        if not isinstance(self.cache_dir, Path):
+            self.cache_dir = Path(self.cache_dir)
+        if self.tts_cache_dir is None:
+            self.tts_cache_dir = self.sfx_dir
+        elif not isinstance(self.tts_cache_dir, Path):
+            self.tts_cache_dir = Path(self.tts_cache_dir)
+
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Config":
         env = os.environ if env is None else env
+        tts_cache = env.get("MUSICBOX_TTS_CACHE_DIR", "").strip()
         return cls(
             host=env.get("MUSICBOX_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST,
             port=_int(env, "MUSICBOX_PORT", DEFAULT_PORT),
@@ -337,4 +377,7 @@ class Config:
             backoff_initial=_float(env, "MUSICBOX_BACKOFF_INITIAL", 1.0),
             backoff_max=_float(env, "MUSICBOX_BACKOFF_MAX", 30.0),
             mixer=MixerConfig.from_env(env),
+            piper_bin=env.get("MUSICBOX_PIPER_BIN", "").strip(),
+            piper_voice=env.get("MUSICBOX_PIPER_VOICE", "").strip(),
+            tts_cache_dir=Path(tts_cache) if tts_cache else None,
         )

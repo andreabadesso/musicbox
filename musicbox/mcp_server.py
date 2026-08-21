@@ -52,12 +52,14 @@ from .app import (
     RequestLane,
     do_reconnect,
     get_mixer,
+    get_tts,
     list_sfx,
     looks_like_uri,
     now_snapshot,
     perform_drop,
     perform_media,
     perform_sfx,
+    perform_say,
     queue_snapshot,
     resolve_sfx,
     search_media,
@@ -107,6 +109,12 @@ the answer says which one happened: with the mixer running the music ducks
 under the effect and repeated presses layer, and without it Music Assistant
 silences the music for the length of the sound and plays repeats one after
 another. Read the answer rather than promising either behaviour up front.
+
+say is the third noise maker and the only one that carries meaning: it speaks a
+sentence out loud, in Brazilian Portuguese, over the music. Use it for what the
+room needs to hear ("faltam trinta minutos") and sfx for how the room should
+feel. It can be switched off on a given box, in which case it says so and plays
+nothing.
 
 Every tool answers with a sentence, including when it fails. Nothing here
 raises, so read the answer rather than assuming a call succeeded.\
@@ -289,6 +297,21 @@ class LocalBackend:
     async def sfx_list(self) -> list[dict[str, Any]]:
         return list_sfx(self._config.sfx_dir)
 
+    async def say(self, text: str, gain_db: float | None) -> dict[str, Any]:
+        # Same base URL rule as sfx above: no incoming request to read a Host
+        # header from, so MUSICBOX_SFX_BASE_URL is what makes the rendered clip
+        # reachable from inside the Music Assistant container on the fallback
+        # path. perform_say, so this tool and POST /say cannot disagree about
+        # which path this box uses.
+        return await perform_say(
+            self._ma,
+            get_tts(),
+            text,
+            sfx_base_url_from_config(self._config),
+            get_mixer(),
+            gain_db,
+        )
+
     async def now(self) -> dict[str, Any]:
         return await now_snapshot(self._ma)
 
@@ -433,6 +456,14 @@ class HttpBackend:
 
     async def sfx_list(self) -> list[dict[str, Any]]:
         return (await self._request("GET", "/sfx")).get("sfx") or []
+
+    async def say(self, text: str, gain_db: float | None) -> dict[str, Any]:
+        body: dict[str, Any] = {"text": text}
+        # Omitted rather than sent as null when unset, so this proxy keeps
+        # working against a musicbox whose /say predates the gain field.
+        if gain_db is not None:
+            body["gain_db"] = gain_db
+        return await self._request("POST", "/say", body)
 
     async def now(self) -> dict[str, Any]:
         return await self._request("GET", "/now")
@@ -924,6 +955,59 @@ def register_tools(mcp: FastMCP, backend: Any) -> None:
             return _describe_drop(result, f"the {result.get('sfx', wanted)!r} sound effect")
         except Exception as exc:  # noqa: BLE001
             return explain(exc)
+
+    @mcp.tool()
+    async def say(text: str, gain_db: float | None = None) -> str:
+        """Speak a sentence out loud in the room, over the music.
+
+        WHEN TO USE THIS versus the other two noise-making tools:
+
+          say   words the room needs to HEAR. "faltam trinta minutos",
+                "o almoco chegou", "a apresentacao comeca em cinco". Anything
+                whose value is in its meaning.
+          sfx   a sound effect already on the box, played by name. An airhorn,
+                applause, a meme sting. Reaction and punctuation, not
+                information.
+          drop  a sound effect from an http(s) URL. Same job as sfx, different
+                source.
+
+        Never use say for something a sound effect does better: a spoken
+        "airhorn" is not an airhorn. Never use sfx to convey a fact.
+
+        The text is spoken in BRAZILIAN PORTUGUESE by a Portuguese voice.
+        English words come out with a Portuguese accent, and numbers are read
+        in Portuguese, so write what you want heard, in Portuguese, spelled out
+        where it matters.
+
+        On a box running musicbox-mixer the voice is layered over the music and
+        the music ducks underneath, so the song keeps playing. Without it, this
+        falls back to a Music Assistant announcement, which SILENCES the music
+        for the length of the sentence. The answer says which one happened, and
+        it is worth reading: on the fallback path, saying three things in a row
+        means three interruptions.
+
+        Keep it to one or two sentences. Longer text is refused rather than cut
+        off, and you will be told the limit.
+
+        This can be off. A box with no speech engine configured answers with a
+        sentence saying so and plays nothing; that is a real state of this box,
+        not a bug, and the music is never interrupted by it.
+        """
+        try:
+            wanted = (text or "").strip()
+            if not wanted:
+                raise ToolFailure("Give something to say. Nothing was spoken.")
+            result = await backend.say(wanted, gain_db)
+            if not result.get("ok"):
+                # Already a full sentence from tts.py or perform_say, written
+                # for this exact reader. Raising it through ToolFailure means
+                # explain() returns it untouched.
+                raise ToolFailure(str(result.get("detail") or "Nothing was spoken."))
+            spoken = result.get("text") or wanted
+            note = result.get("note") or ""
+            return f"Said {spoken!r} out loud. {note}".strip()
+        except Exception as exc:  # noqa: BLE001
+            return explain(exc, tail="Nothing was spoken.")
 
     @mcp.tool()
     async def list_sfx() -> dict[str, Any]:

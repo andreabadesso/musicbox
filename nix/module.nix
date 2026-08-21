@@ -177,6 +177,55 @@
 #      sudo cp airhorn.mp3 /var/lib/musicbox/sfx/
 #      curl http://127.0.0.1:8099/sfx     # confirm it is listed
 #
+# ── Turning speech on, and why the piper line looks like that ───────────────
+# services.musicbox.tts.enable is off by default and the whole block is written
+# so that with it off this module renders BYTE for byte what it rendered before
+# speech existed. That was checked by evaluation rather than asserted: the
+# aarch64-linux system toplevel drvPath, the musicbox.service text, the
+# musicbox-mixer.service text and the ExecStartPre script path all come out
+# identical against the previous revision of this file.
+#
+# In hosts/pi5/musicbox.nix:
+#
+#   services.musicbox.tts = {
+#     enable = true;
+#     # NOT pkgs.piper-tts. On this host raspberry-pi-nix overlays libcamera and
+#     # libpisp, everything downstream of them rebuilds, and piper sits on top of
+#     # onnxruntime: that is a multi-hour aarch64 source build on a box that
+#     # boots off an SD card and has wedged itself twice doing exactly this. The
+#     # same package from the UN-OVERLAID input substitutes from cache.nixos.org
+#     # with zero source builds. Same trap and same fix as the browser in
+#     # ./hermes-desktop.nix, which explains it at length.
+#     package = nixpkgs-unstable.legacyPackages.${pkgs.stdenv.hostPlatform.system}.piper-tts;
+#   };
+#
+# There is no default for `package` on purpose, and enabling without one is an
+# assertion rather than a fallback: the wrong choice here is not a warning in a
+# log, it is a rebuild that never finishes.
+#
+# ── What that download costs, measured ──────────────────────────────────────
+# Cached does not mean small. Checked against cache.nixos.org for aarch64-linux
+# at nixpkgs e2587caef70cea85dd97d7daab492899902dbf5d, which is where the pi5
+# flake pins nixpkgs-unstable:
+#
+#   piper-tts 1.4.2   closure 4090 MiB on disk, 978 MiB to download, 0 source builds
+#   the voice model      63 MB, one fetchurl, straight from HuggingFace
+#
+# The Pi had 18 GB free when this was written, so it fits, but a gigabyte over
+# the event wifi in the middle of a rebuild is its own risk. Warm the store
+# first, from a machine with a better link, without touching anything running:
+#
+#   nix copy --from https://cache.nixos.org --to ssh://andre@<pi> \
+#     "$(nix eval --raw --impure --expr '(builtins.getFlake "github:nixos/nixpkgs/e2587caef70cea85dd97d7daab492899902dbf5d").legacyPackages.aarch64-linux.piper-tts')"
+#
+# Most of that gigabyte is torch, lightning and tensorboard, which nixpkgs pulls
+# in because piper-tts defaults to withTrain = true and this box will never train
+# a voice. `piper-tts.override { withTrain = false; }` cuts it to a fraction, and
+# it is deliberately NOT done here: an override is a new derivation, nothing
+# substitutes, and piper builds a C extension against espeak-ng. Trading a known
+# download for an unknown compile is the wrong direction on this host. Do it
+# after the event, on a machine that is not the Pi, and push the result.
+#
 # ── A trap worth naming: MA fetches your sfx URL itself ─────────────────────
 # `players/cmd/play_announcement` refuses anything that is not http(s) (there
 # is a literal `if not url.startswith("http")` in MA's player controller), so a
@@ -345,6 +394,63 @@ let
   # dynamic uid.
   sfxStateDir = lib.removePrefix "/var/lib/" cfg.sfxDir;
   cacheStateDir = lib.removePrefix "/var/lib/" cfg.cacheDir;
+  # Same rule for the rendered speech, and it is only ever a directory of its own
+  # when someone has deliberately pointed tts.cacheDir away from sfxDir. The
+  # default is sfxDir itself, and the option explains why that is a protocol
+  # constraint rather than laziness.
+  ttsStateDir = lib.removePrefix "/var/lib/" cfg.tts.cacheDir;
+  ttsDirIsSeparate = cfg.tts.cacheDir != cfg.sfxDir;
+
+  # ── The Brazilian Portuguese voice ──────────────────────────────────────────
+  # piper needs TWO files and the way it fails without the second one is the
+  # trap. The .onnx is the model; the .onnx.json beside it carries the sample
+  # rate, the phoneme id map and the espeak voice ("pt-br" for this one). piper
+  # derives the json path itself by appending ".json" to the model path, so a
+  # missing json surfaces as a FileNotFoundError naming a file the caller never
+  # typed, which reads as "the model is missing" while the model sits right
+  # there. Both are pinned here, together, so that cannot happen.
+  #
+  # Fetched rather than vendored: 63 MB of weights have no business in a repo
+  # that gets rsynced to the Pi on every deploy. These are fixed output
+  # derivations, so the download happens once per hash at BUILD time and never
+  # at speech time, which is the property that matters when the link is the
+  # event wifi.
+  #
+  # faber/medium of the four pt_BR voices that exist in rhasspy/piper-voices
+  # (faber, cadu and jeff at medium, edresson at low). medium is 22050 Hz mono,
+  # which is NOT the 48000:16:2 that snapcast, the mixer and the speaker all
+  # speak. Nothing here converts it: the mixer's EffectCache already shells out
+  # to ffmpeg to bring arbitrary audio to STREAM_FORMAT, and a second converter
+  # would be a second place for the rate to be wrong.
+  #
+  # The hashes were computed, not guessed, on 2026-08-20:
+  #   nix-prefetch-url --type sha256 <url>
+  #   nix hash convert --hash-algo sha256 --to sri <the base32 it printed>
+  # A wrong hash here does not fail at eval, it fails halfway through the
+  # user's `nixos-rebuild switch` after the download, which is the worst place
+  # on this box for anything to fail.
+  piperVoiceFaberMedium =
+    # A runCommand with two symlinks, not symlinkJoin: fetchurl names its output
+    # after the last path segment of the url, so the names are already right,
+    # and spelling them out here means the pair piper is going to look for is
+    # visible in the same place as the comment explaining why it needs a pair.
+    # Symlinks are enough, piper only opens the files.
+    let
+      base = "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium";
+      onnx = pkgs.fetchurl {
+        url = "${base}/pt_BR-faber-medium.onnx";
+        hash = "sha256-hYVV46BkIJxXCI/mvXDEw9xU0D6qAMRdXsr0OjP5Wqc=";
+      };
+      onnxJson = pkgs.fetchurl {
+        url = "${base}/pt_BR-faber-medium.onnx.json";
+        hash = "sha256-fmlN4ZWuP8Nt1zLEResE+0m2SYVIk8tVBrl48NUKHW8=";
+      };
+    in
+    pkgs.runCommand "piper-voice-pt_BR-faber-medium" { } ''
+      mkdir -p "$out"
+      ln -s ${onnx} "$out/pt_BR-faber-medium.onnx"
+      ln -s ${onnxJson} "$out/pt_BR-faber-medium.onnx.json"
+    '';
 
   # The address MA has to use to fetch our sfx files. See the trap note at the
   # top of this file for why this is pinned rather than inferred per request.
@@ -964,6 +1070,125 @@ in
         '';
       };
     };
+
+    # ── Speech ────────────────────────────────────────────────────────────────
+    # Off by default, and unlike most defaults that one is checked by evaluation
+    # rather than trusted: with tts.enable false the rendered musicbox.service
+    # and musicbox-mixer.service are byte for byte what they are without this
+    # block existing at all. Everything below is additive under an optional.
+    #
+    # Off is also a SUPPORTED RUNNING STATE, not just an install-time default.
+    # musicbox reports tts_available false in GET /health and say() answers with
+    # a sentence explaining why instead of raising, because the worst thing this
+    # box does is go quiet with every unit green.
+    tts = {
+      enable = mkEnableOption ''
+        speech. musicbox renders text to a wav with piper and plays it OVER the
+        music through musicbox-mixer, the same way sound effects go, so the
+        room hears a voice on top of the song rather than the song stopping.
+
+        With the mixer off or its socket unreachable, speech falls back to Music
+        Assistant's announcement path, which DOES silence the music for the
+        duration. That is the fallback and not the main path on purpose: MA
+        serialises announcements and gives no way to duck instead of pause.
+
+        This option only wires the engine up. It does not make the box speak on
+        its own; something has to call say()
+      '';
+
+      package = mkOption {
+        type = types.nullOr types.package;
+        default = null;
+        example = lib.literalExpression "inputs.nixpkgs-unstable.legacyPackages.aarch64-linux.piper-tts";
+        description = ''
+          The piper package. Null by default and asserted non-null when
+          tts.enable is on, which is deliberate friction: there is no safe
+          default here.
+
+          On the Pi, `pkgs.piper-tts` is NOT the same derivation as
+          `piper-tts` from a plain nixpkgs. raspberry-pi-nix overlays
+          libcamera and libpisp, every package downstream of them rebuilds, and
+          piper drags in onnxruntime and (with the default withTrain = true)
+          torch. That is a multi-hour aarch64 source build on a host that boots
+          off an SD card and has wedged itself twice doing exactly this.
+
+          Take it from an un-overlaid nixpkgs instead, where it substitutes from
+          cache.nixos.org with zero source builds. See the snippet in the module
+          header. Defaulting to `pkgs.piper-tts` would have made the wrong thing
+          the easy thing, and the punishment for it lands during a deploy.
+        '';
+      };
+
+      voice = mkOption {
+        type = types.str;
+        default = "${piperVoiceFaberMedium}/pt_BR-faber-medium.onnx";
+        defaultText = lib.literalExpression ''"''${piperVoiceFaberMedium}/pt_BR-faber-medium.onnx"'';
+        description = ''
+          Absolute path to the piper voice model (.onnx). Its .onnx.json must
+          sit beside it under the same name plus .json; piper builds that path
+          itself and never mentions that it did.
+
+          The default is pt_BR-faber-medium, fetched and pinned by this module
+          (see piperVoiceFaberMedium). Point this somewhere else only if you
+          have both files on disk yourself.
+
+          A string and not a nix path value, for the same reason tokenFile is:
+          a path value gets copied into the store at interpolation time. Here
+          that is merely wasteful rather than a secret leak, but the surprise is
+          the same.
+        '';
+      };
+
+      # THERE IS NO voiceName OPTION, and there was one until it was checked.
+      # It described itself as the thing musicbox keys the render cache on, and
+      # nothing read it: not config.py, not tts.py, not a test. The env var it
+      # set, MUSICBOX_TTS_VOICE_NAME, was written by this module and read by
+      # nobody. An option that claims to invalidate a cache and does not is
+      # worse than no option, because the next person to swap the voice will
+      # bump it, hear yesterday's voice, and go looking anywhere but here.
+      #
+      # What actually happens is stronger than what it promised. TTS.cache_path
+      # hashes (voice PATH, text), and the path is a nix store path, so any
+      # change to the model or its json is a different hash and every sentence
+      # re-renders on its own. The name in GET /health is the model filename
+      # without its extension, which for the pinned voice is already exactly
+      # "pt_BR-faber-medium".
+
+      cacheDir = mkOption {
+        type = types.str;
+        default = cfg.sfxDir;
+        defaultText = lib.literalExpression "config.services.musicbox.sfxDir";
+        description = ''
+          Where rendered wavs are kept, keyed by (text, voice).
+
+          The cache is not an optimisation, it is the feature. The same sentence
+          gets spoken many times in one evening ("faltam 30 minutos", at every
+          checkpoint), and piper takes hundreds of milliseconds to a couple of
+          seconds per sentence on this Pi. First time it is rendered; every time
+          after that it is a stat call.
+
+          It defaults to sfxDir, the SAME directory the sound effects live in,
+          and that is a protocol constraint rather than a shortcut. The mixer
+          only plays effects its EffectCache decoded, EffectCache scans exactly
+          one flat directory (MUSICBOX_SFX_DIR), and the control protocol has no
+          "play this file" command, only `play <name>` against that cache. A wav
+          rendered anywhere else is therefore unplayable through the mixer, and
+          say() would fall back to the announcement path forever while every
+          unit stayed green. Sharing the directory also gets the fallback for
+          free: GET /sfx/file/<name> already serves it over http, which is the
+          only thing Music Assistant will accept as an announcement source.
+
+          Speech clips are named say-<hash>.wav so they can be told apart from
+          the effects a human put there: musicbox hides that prefix from the
+          soundboard and from GET /sfx, and its pruning refuses to touch
+          anything without it.
+
+          Must live under /var/lib: it is a systemd StateDirectory, the only
+          mechanism that gets ownership right under DynamicUser. Same rule and
+          same reason as sfxDir and cacheDir.
+        '';
+      };
+    };
   };
 
   config = mkIf cfg.enable (lib.mkMerge [
@@ -989,6 +1214,43 @@ in
         }
         (notInStore "tokenFile" cfg.tokenFile)
         (notInStore "maTokenFile" cfg.maTokenFile)
+        {
+          assertion = cfg.tts.enable -> cfg.tts.package != null;
+          message =
+            "services.musicbox.tts.enable is on but services.musicbox.tts.package is null. "
+            + "There is no default on purpose: pkgs.piper-tts on a raspberry-pi-nix host is "
+            + "a multi-hour source build, because the libcamera/libpisp overlay invalidates "
+            + "everything downstream of it. Take piper from an UN-OVERLAID nixpkgs, where it "
+            + "substitutes from cache.nixos.org, e.g. "
+            + "tts.package = inputs.nixpkgs-unstable.legacyPackages.\${pkgs.stdenv.hostPlatform.system}.piper-tts;";
+        }
+        {
+          assertion = cfg.tts.enable -> lib.hasPrefix "/var/lib/" cfg.tts.cacheDir;
+          message =
+            "services.musicbox.tts.cacheDir must live under /var/lib (got ${cfg.tts.cacheDir}). "
+            + "Same reason as sfxDir: it is created as a systemd StateDirectory, which is what "
+            + "gets ownership right under DynamicUser.";
+        }
+        {
+          assertion = (cfg.tts.enable && cfg.mixer.enable) -> !ttsDirIsSeparate;
+          message =
+            "services.musicbox.tts.cacheDir (${cfg.tts.cacheDir}) must equal "
+            + "services.musicbox.sfxDir (${cfg.sfxDir}) while the mixer is enabled. "
+            + "The mixer plays a clip by NAME out of the one flat directory its "
+            + "EffectCache scanned, and that directory is sfxDir; there is no "
+            + "play-this-file command in the control protocol. A wav rendered anywhere "
+            + "else is unplayable through the mixer, so every say() would quietly take "
+            + "the Music Assistant announcement path instead, which stops the music. "
+            + "This is refused rather than warned about because the symptom is the box "
+            + "working, badly, with every unit green.";
+        }
+        {
+          assertion = cfg.tts.enable -> cfg.tts.voice != "";
+          message =
+            "services.musicbox.tts.voice is empty. musicbox treats an empty voice as "
+            + "\"TTS is not configured\" and answers say() with a sentence instead of speaking, "
+            + "so this would deploy green and never make a sound.";
+        }
       ];
 
       warnings = lib.optional (cfg.maTokenFile == null) ''
@@ -1031,7 +1293,27 @@ in
         lib.optionalAttrs cfg.mixer.enable {
           MUSICBOX_MIXER = "1";
           MUSICBOX_MIXER_SOCKET = cfg.mixer.socket;
-        };
+        }
+        # ── Speech ────────────────────────────────────────────────────────
+        # All four unset when tts.enable is off, and musicbox reads an unset
+        # MUSICBOX_PIPER_BIN as "TTS is not configured", reports that in
+        # /health and returns a readable sentence from say(). That is the
+        # supported off state, not a broken one.
+        #
+        # An absolute store path for the binary, never a bare "piper" to be
+        # found on PATH. A systemd service on this box does not inherit the
+        # system PATH (the default is coreutils, findutils, gnugrep, gnused and
+        # systemd, nothing else), so a bare name would work on the developer's
+        # Mac and silently not here, which is the failure this whole feature
+        # cannot afford. getExe' rather than getExe so the name is pinned in
+        # this file rather than taken from whatever meta.mainProgram says.
+        //
+        lib.optionalAttrs cfg.tts.enable {
+          MUSICBOX_PIPER_BIN = lib.getExe' cfg.tts.package "piper";
+          MUSICBOX_PIPER_VOICE = cfg.tts.voice;
+          MUSICBOX_TTS_CACHE_DIR = cfg.tts.cacheDir;
+        }
+        ;
 
         serviceConfig = {
           Type = "simple";
@@ -1053,7 +1335,17 @@ in
           # nasceria fora do alcance do uid transitorio: o download falharia com
           # permissao negada e a caixa voltaria a tocar em streaming sem que
           # ninguem entendesse por que.
-          StateDirectory = [ sfxStateDir cacheStateDir ];
+          # Three directories when speech is on, and the list is the whole
+          # reason it works: systemd creates each one and chowns it to the
+          # transient uid before exec. A directory musicbox creates itself
+          # would be fine too, but only this list survives the uid being
+          # reallocated on the next boot.
+          #
+          # `++ lib.optional` and not a conditional list literal, so that with
+          # tts off this is the same value it has always been rather than a new
+          # one that happens to be equal.
+          StateDirectory = [ sfxStateDir cacheStateDir ]
+            ++ lib.optional (cfg.tts.enable && ttsDirIsSeparate) ttsStateDir;
           # 0755 so a human can read what they dropped in. The dir sits inside
           # /var/lib/private, which is 0700 root, so this is not an exposure:
           # it just means root can `cp` files in without a chown dance.
@@ -1135,6 +1427,23 @@ in
           # musicbox would refuse to start whenever the mixer was down, and
           # taking the HTTP API out with the mixer is the opposite of a fallback.
           ReadWritePaths = [ "-${mixerRuntimeDir}" ];
+        }
+        # ── What running piper inside this sandbox costs ────────────────────
+        //
+        lib.optionalAttrs cfg.tts.enable {
+          # ProcSubset = "pid" mounts /proc with subset=pid, which hides
+          # /proc/cpuinfo, /proc/meminfo and /proc/stat from the service. piper
+          # is onnxruntime, and onnxruntime's CPU feature detection on aarch64
+          # Linux goes through pytorch-cpuinfo, which parses /proc/cpuinfo. This
+          # is relaxed as a precaution rather than after seeing it break, and
+          # the precaution is the point: the failure would be a crash or a hang
+          # inside a shared library on the first say() of the evening, reported
+          # as a musicbox bug. Nothing else in this unit reads /proc, and the
+          # process is still unprivileged, namespaced and syscall filtered.
+          #
+          # Re-tighten it after the event if someone measures that piper is fine
+          # with subset=pid on this box. Do not re-tighten it on the day.
+          ProcSubset = "all";
         };
       };
 
@@ -1829,6 +2138,12 @@ in
           # state of a box where musicbox has never started. The mixer then finds
           # an empty sfx directory and says so, which is a better failure than a
           # unit that refuses to start.
+          # It carries the rendered speech too, and needs no second entry to do
+          # it: musicbox writes say-<hash>.wav INTO the sfx directory, because
+          # that is the only directory the mixer's EffectCache scans. The mount
+          # is live rather than a snapshot, since a bind mount shares the inode,
+          # so a wav rendered a second from now is visible here the moment it
+          # lands and a `reload` on the control socket picks it up.
           BindReadOnlyPaths = [ "-${mixerSfxSource}:${mixerSfxDir}" ];
 
           # `always`, not `on-failure`, and the same reasoning as snapclient's:
