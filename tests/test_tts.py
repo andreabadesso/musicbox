@@ -19,6 +19,7 @@ stub only records the calls it was asked to make.
 
 from __future__ import annotations
 
+import os
 import struct
 import sys
 import wave
@@ -122,6 +123,33 @@ async def test_render_writes_a_playable_wav_into_the_sfx_dir(tmp_path):
     with wave.open(str(out.path), "rb") as handle:
         assert handle.getnframes() > 0
     assert out.duration and out.duration > 0
+
+
+@async_test()
+async def test_the_rendered_clip_is_readable_by_the_mixer_user(tmp_path):
+    """0600 here means speech is silent with every check green.
+
+    musicbox renders under DynamicUser; the mixer runs as its own user and
+    opens the wav as that other uid. mkstemp makes 0600 and os.replace keeps
+    the source mode, so the clip would arrive unreadable to the only process
+    that can play it — and nothing would report an error: piper succeeds,
+    /health stays green, POST /say answers 200, and the mixer's scan just
+    skips the file. Measured on the pi5: cache count 27 at 0600, 28 at 0644.
+    """
+    tts = tts_for(tmp_path)
+    # The unit sets UMask=0077, so reproduce it — under the 0022 a developer
+    # shell has, piper's own file already lands 0644 and this test proves
+    # nothing at all. Verified: with the chmod removed and this umask in
+    # place, the assertion below fails.
+    previous = os.umask(0o077)
+    try:
+        out = await tts.render("faltam trinta minutos")
+    finally:
+        os.umask(previous)
+    mode = out.path.stat().st_mode & 0o777
+    assert mode & 0o044 == 0o044, (
+        f"clip is {mode:#o}; the mixer runs as another user and cannot open it"
+    )
 
 
 @async_test()

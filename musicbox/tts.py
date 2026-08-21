@@ -530,6 +530,36 @@ class TTS:
             # this is the line that says the render stopped looking like a wav.
             logs.warn("tts_unreadable_header", file=tmp.name, chars=len(text))
 
+        # Readable by everyone, on purpose, and this is load bearing.
+        #
+        # The mixer runs as its OWN user (musicbox-mixer), while musicbox runs
+        # under DynamicUser. The wav is handed over by leaving it in the shared
+        # sfx dir, and the mixer only ever opens it as that other uid. piper
+        # creates this file itself, under the service UMask, and the NixOS unit
+        # sets UMask=0077 — so it lands 0600 and os.replace keeps that mode
+        # rather than taking the target's. Unreadable to the only process that
+        # can play it.
+        #
+        # What that failure looks like is worth naming, because nothing errors:
+        # piper renders fine, `tts_rendered` is logged, /health stays green with
+        # tts_available true, POST /say answers 200 — and the mixer's scan
+        # silently skips the file it cannot open, so `play` comes back
+        # `not_found` and speech falls through to the announcement path, which
+        # needs MA and stops the music. Measured on the pi5: mixer cache count
+        # 27 with the clip at 0600, 28 with the same clip at 0644.
+        #
+        # Fixed here and not with UMask= in the unit, because the mode this file
+        # needs is a property of the handoff, not of the host wiring it.
+        # The directory is already shared; there is no secret in a party wav.
+        try:
+            os.chmod(tmp, 0o644)
+        except OSError as exc:
+            # Not fatal by itself: if the mode was already right (a umask that
+            # allows it, or a future non-mkstemp path) the clip still plays.
+            # Logged rather than raised so a chmod refusal on some exotic
+            # filesystem does not take speech down entirely.
+            logs.warn("tts_chmod_failed", file=tmp.name, error=str(exc))
+
         try:
             os.replace(tmp, target)
         except OSError as exc:
